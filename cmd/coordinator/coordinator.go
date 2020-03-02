@@ -45,7 +45,9 @@ import (
 	"unicode"
 
 	"go4.org/syncutil"
-	grpc "grpc.go4.org"
+	"golang.org/x/build/cmd/coordinator/protos"
+	"google.golang.org/grpc"
+	grpc4 "grpc.go4.org"
 
 	"cloud.google.com/go/errorreporting"
 	"cloud.google.com/go/storage"
@@ -62,6 +64,7 @@ import (
 	"golang.org/x/build/internal/sourcecache"
 	"golang.org/x/build/livelog"
 	"golang.org/x/build/maintner/maintnerd/apipb"
+	"golang.org/x/build/repos"
 	revdialv2 "golang.org/x/build/revdial/v2"
 	"golang.org/x/build/types"
 	"golang.org/x/crypto/acme/autocert"
@@ -161,8 +164,9 @@ func listenAndServeTLS() {
 }
 
 func serveTLS(ln net.Listener) {
+	// Support HTTP/2 for gRPC handlers.
 	config := &tls.Config{
-		NextProtos: []string{"http/1.1"},
+		NextProtos: []string{"http/1.1", "h2"},
 	}
 
 	if autocertManager != nil {
@@ -239,6 +243,9 @@ func (fn loggerFunc) CreateSpan(event string, optText ...string) spanlog.Span {
 // autocertManager is non-nil if LetsEncrypt is in use.
 var autocertManager *autocert.Manager
 
+// grpcServer is a shared gRPC server. It is global, as it needs to be used in places that aren't factored otherwise.
+var grpcServer = grpc.NewServer()
+
 func main() {
 	flag.Parse()
 
@@ -292,12 +299,14 @@ func main() {
 
 	addHealthCheckers(context.Background())
 
-	cc, err := grpc.NewClient(http.DefaultClient, "https://maintner.golang.org")
+	cc, err := grpc4.NewClient(http.DefaultClient, "https://maintner.golang.org")
 	if err != nil {
 		log.Fatal(err)
 	}
 	maintnerClient = apipb.NewMaintnerServiceClient(cc)
 
+	gs := &gRPCServer{dashboardURL: "https://build.golang.org"}
+	protos.RegisterCoordinatorServer(grpcServer, gs)
 	http.HandleFunc("/", handleStatus)
 	http.HandleFunc("/debug/goroutines", handleDebugGoroutines)
 	http.HandleFunc("/debug/watcher/", handleDebugWatcher)
@@ -309,6 +318,7 @@ func main() {
 	http.HandleFunc("/try", serveTryStatus(false))
 	http.HandleFunc("/try.json", serveTryStatus(true))
 	http.HandleFunc("/status/reverse.json", reversePool.ServeReverseStatusJSON)
+	http.HandleFunc("/status/post-submit-active.json", handlePostSubmitActiveJSON)
 	http.Handle("/buildlet/create", requireBuildletProxyAuth(http.HandlerFunc(handleBuildletCreate)))
 	http.Handle("/buildlet/list", requireBuildletProxyAuth(http.HandlerFunc(handleBuildletList)))
 	go func() {
@@ -325,12 +335,9 @@ func main() {
 		}
 	}()
 
-	workc := make(chan buildgo.BuilderRev)
-
 	if *mode == "dev" {
 		// TODO(crawshaw): do more in dev mode
 		gcePool.SetEnabled(*devEnableGCE)
-		http.HandleFunc("/dosomework/", handleDoSomeWork(workc))
 	} else {
 		go gcePool.cleanUpOldVMs()
 		if kubeErr == nil {
@@ -342,7 +349,7 @@ func main() {
 		}
 
 		go listenAndServeInternalModuleProxy()
-		go findWorkLoop(workc)
+		go findWorkLoop()
 		go findTryWorkLoop()
 		go reportMetrics(context.Background())
 		// TODO(cmang): gccgo will need its own findWorkLoop
@@ -351,23 +358,57 @@ func main() {
 	go listenAndServeTLS()
 	go listenAndServeSSH() // ssh proxy to remote buildlets; remote.go
 
-	for {
-		work := <-workc
-		if !mayBuildRev(work) {
-			if inStaging {
-				if _, ok := dashboard.Builders[work.Name]; ok && logCantBuildStaging.Allow() {
-					log.Printf("may not build %v; skipping", work)
-				}
-			}
-			continue
-		}
-		st, err := newBuild(work)
-		if err != nil {
-			log.Printf("Bad build work params %v: %v", work, err)
-		} else {
-			st.start()
-		}
+	select {}
+}
+
+// ignoreAllNewWork, when true, prevents addWork from doing anything.
+// It's sometimes set in staging mode when people are debugging
+// certain paths.
+var ignoreAllNewWork bool
+
+// addWorkTestHook is optionally set by tests.
+var addWorkTestHook func(buildgo.BuilderRev, *commitDetail)
+
+type commitDetail struct {
+	// CommitTime is the greater of 1 or 2 possible git committer
+	// times: the commit time of the associated BuilderRev.Rev
+	// (for the BuilderRev also passed to addWorkDetail) or
+	// BuilderRev.SubRev (if not empty).
+	CommitTime string // in time.RFC3339 format
+
+	Branch string
+}
+
+func addWork(work buildgo.BuilderRev) {
+	addWorkDetail(work, nil)
+}
+
+// addWorkDetail adds some work to (maybe) do, if it's not already
+// enqueued and the builders are configured to run the given repo. The
+// detail argument is optional and used for scheduling. It's currently
+// only used for post-submit builds.
+func addWorkDetail(work buildgo.BuilderRev, detail *commitDetail) {
+	if f := addWorkTestHook; f != nil {
+		f(work, detail)
+		return
 	}
+	if ignoreAllNewWork || isBuilding(work) {
+		return
+	}
+	if !mayBuildRev(work) {
+		if inStaging {
+			if _, ok := dashboard.Builders[work.Name]; ok && logCantBuildStaging.Allow() {
+				log.Printf("may not build %v; skipping", work)
+			}
+		}
+		return
+	}
+	st, err := newBuild(work, detail)
+	if err != nil {
+		log.Printf("Bad build work params %v: %v", work, err)
+		return
+	}
+	st.start()
 }
 
 // httpToHTTPSRedirector redirects all requests from http to https.
@@ -438,17 +479,6 @@ func numCurrentBuilds() int {
 	return len(status)
 }
 
-func numCurrentBuildsOfType(typ string) (n int) {
-	statusMu.Lock()
-	defer statusMu.Unlock()
-	for rev := range status {
-		if rev.Name == typ {
-			n++
-		}
-	}
-	return
-}
-
 func isBuilding(work buildgo.BuilderRev) bool {
 	statusMu.Lock()
 	defer statusMu.Unlock()
@@ -468,6 +498,13 @@ func mayBuildRev(rev buildgo.BuilderRev) bool {
 	if isBuilding(rev) {
 		return false
 	}
+	if rev.SubName != "" {
+		// Don't build repos we don't know about,
+		// so importPathOfRepo won't panic later.
+		if r, ok := repos.ByGerritProject[rev.SubName]; !ok || r.ImportPath == "" || !r.CoordinatorCanBuild {
+			return false
+		}
+	}
 	buildConf, ok := dashboard.Builders[rev.Name]
 	if !ok {
 		if logUnknownBuilder.Allow() {
@@ -476,9 +513,6 @@ func mayBuildRev(rev buildgo.BuilderRev) bool {
 		return false
 	}
 	if buildEnv.MaxBuilds > 0 && numCurrentBuilds() >= buildEnv.MaxBuilds {
-		return false
-	}
-	if buildConf.MaxAtOnce > 0 && numCurrentBuildsOfType(rev.Name) >= buildConf.MaxAtOnce {
 		return false
 	}
 	if buildConf.IsReverse() && !reversePool.CanBuild(buildConf.HostType) {
@@ -543,6 +577,30 @@ func getStatus(work buildgo.BuilderRev, statusPtrStr string) *buildStatus {
 		}
 	}
 	return nil
+}
+
+// cancelOnePostSubmitBuildWithHostType tries to cancel one
+// post-submit (non trybot) build with the provided host type and
+// reports whether it did so.
+//
+// It currently selects the one that's been running the least amount
+// of time, but that's not guaranteed.
+func cancelOnePostSubmitBuildWithHostType(hostType string) bool {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	var best *buildStatus
+	for _, st := range status {
+		if st.isTry() || st.conf.HostType != hostType {
+			continue
+		}
+		if best == nil || st.startTime.After(best.startTime) {
+			best = st
+		}
+	}
+	if best != nil {
+		go best.cancelBuild()
+	}
+	return best != nil
 }
 
 type byAge []*buildStatus
@@ -702,7 +760,7 @@ func serveTryStatusHTML(w http.ResponseWriter, ts *trySet, tss trySetState) {
 		fmt.Fprintf(buf, "<tr valign=top><td align=left>%s</td><td align=center>%s</td><td><pre>%s</pre></td></tr>\n",
 			html.EscapeString(bs.NameAndBranch()),
 			status,
-			bs.HTMLStatusLine())
+			bs.HTMLStatusTruncated())
 	}
 	fmt.Fprintf(buf, "</table>")
 	w.Write(buf.Bytes())
@@ -796,7 +854,7 @@ func writeStatusHeader(w http.ResponseWriter, st *buildStatus) {
 	}
 	if len(st.events) > 0 {
 		io.WriteString(w, "\nEvents:\n")
-		st.writeEventsLocked(w, false)
+		st.writeEventsLocked(w, false, 0)
 	}
 	io.WriteString(w, "\nBuild log:\n")
 	workaroundFlush(w)
@@ -811,19 +869,21 @@ func workaroundFlush(w http.ResponseWriter) {
 	w.(http.Flusher).Flush()
 }
 
-// findWorkLoop polls https://build.golang.org/?mode=json looking for new work
-// for the main dashboard. It does not support gccgo.
-func findWorkLoop(work chan<- buildgo.BuilderRev) {
+// findWorkLoop polls https://build.golang.org/?mode=json looking for
+// new post-submit work for the main dashboard. It does not support
+// gccgo. This is separate from trybots, which populates its work from
+// findTryWorkLoop.
+func findWorkLoop() {
 	// Useful for debugging a single run:
 	if inStaging && false {
 		const debugSubrepo = false
 		if debugSubrepo {
-			work <- buildgo.BuilderRev{
+			addWork(buildgo.BuilderRev{
 				Name:    "linux-arm",
 				Rev:     "c9778ec302b2e0e0d6027e1e0fca892e428d9657",
 				SubName: "tools",
 				SubRev:  "ac303766f5f240c1796eeea3dc9bf34f1261aa35",
-			}
+			})
 		}
 		const debugArm = false
 		if debugArm {
@@ -832,33 +892,39 @@ func findWorkLoop(work chan<- buildgo.BuilderRev) {
 				time.Sleep(time.Second)
 			}
 			log.Printf("ARM machine(s) registered.")
-			work <- buildgo.BuilderRev{Name: "linux-arm", Rev: "3129c67db76bc8ee13a1edc38a6c25f9eddcbc6c"}
+			addWork(buildgo.BuilderRev{Name: "linux-arm", Rev: "3129c67db76bc8ee13a1edc38a6c25f9eddcbc6c"})
 		} else {
-			work <- buildgo.BuilderRev{Name: "linux-amd64", Rev: "9b16b9c7f95562bb290f5015324a345be855894d"}
-			work <- buildgo.BuilderRev{Name: "linux-amd64-sid", Rev: "9b16b9c7f95562bb290f5015324a345be855894d"}
-			work <- buildgo.BuilderRev{Name: "linux-amd64-clang", Rev: "9b16b9c7f95562bb290f5015324a345be855894d"}
+			addWork(buildgo.BuilderRev{Name: "linux-amd64", Rev: "9b16b9c7f95562bb290f5015324a345be855894d"})
+			addWork(buildgo.BuilderRev{Name: "linux-amd64-sid", Rev: "9b16b9c7f95562bb290f5015324a345be855894d"})
+			addWork(buildgo.BuilderRev{Name: "linux-amd64-clang", Rev: "9b16b9c7f95562bb290f5015324a345be855894d"})
 		}
-
-		// Still run findWork but ignore what it does.
-		ignore := make(chan buildgo.BuilderRev)
-		go func() {
-			for range ignore {
-			}
-		}()
-		work = ignore
+		ignoreAllNewWork = true
 	}
+	// TODO: remove this hard-coded 15 second ticker and instead
+	// do some new streaming gRPC call to maintnerd to subscribe
+	// to new commits.
 	ticker := time.NewTicker(15 * time.Second)
-	for {
-		if err := findWork(work); err != nil {
+	// We wait for the ticker first, before looking for work, to
+	// give findTryWork a head start. Because try work is more
+	// important and the scheduler can't (yet?) preempt an
+	// existing post-submit build to take it over for a trybot, we
+	// want to make sure that reverse buildlets get assigned to
+	// trybots/slowbots first on start-up.
+	for range ticker.C {
+		if err := findWork(); err != nil {
 			log.Printf("failed to find new work: %v", err)
 		}
-		<-ticker.C
 	}
 }
 
-func findWork(work chan<- buildgo.BuilderRev) error {
+// findWork polls the https://build.golang.org/ dashboard once to find
+// post-submit work to do. It's called in a loop by findWorkLoop.
+func findWork() error {
 	var bs types.BuildStatus
-	if err := dash("GET", "", url.Values{"mode": {"json"}}, nil, &bs); err != nil {
+	if err := dash("GET", "", url.Values{
+		"mode":   {"json"},
+		"branch": {"mixed"},
+	}, nil, &bs); err != nil {
 		return err
 	}
 	knownToDashboard := map[string]bool{} // keys are builder
@@ -866,31 +932,37 @@ func findWork(work chan<- buildgo.BuilderRev) error {
 		knownToDashboard[b] = true
 	}
 
-	// Before, we just sent all the possible work to workc,
-	// which then kicks off lots of goroutines that fight over
-	// available buildlets, with the result that we run a random
-	// subset of the possible work. But really we want to run
-	// the newest possible work, so that lines at the top of the
-	// build dashboard are filled in before lines below.
-	// It's a bit hard to push that preference all the way through
-	// this code base, but we can tilt the scales a little by only
-	// sending one job to workc for each different builder
-	// on each findWork call. The findWork calls happen every
-	// 15 seconds, so we will now only kick off one build of
-	// a particular host type (for example, darwin-arm64) every
-	// 15 seconds, but they should be skewed toward new work.
-	// This depends on the build dashboard sending back the list
-	// of empty slots newest first (matching the order on the main screen).
-	sent := map[string]bool{}
-
 	var goRevisions []string // revisions of repo "go", branch "master" revisions
 	seenSubrepo := make(map[string]bool)
+	commitTime := make(map[string]string)   // git rev => "2019-11-20T22:54:54Z" (time.RFC3339 from build.golang.org's JSON)
+	commitBranch := make(map[string]string) // git rev => "master"
+
+	add := func(br buildgo.BuilderRev) {
+		rev := br.Rev
+		ct := commitTime[br.Rev]
+		if br.SubRev != "" {
+			rev = br.SubRev
+			if t := commitTime[rev]; t > ct {
+				ct = t
+			}
+		}
+		addWorkDetail(br, &commitDetail{
+			CommitTime: ct,
+			Branch:     commitBranch[rev],
+		})
+	}
+
 	for _, br := range bs.Revisions {
+		if r, ok := repos.ByGerritProject[br.Repo]; !ok || !r.CoordinatorCanBuild {
+			continue
+		}
 		if br.Repo == "grpc-review" {
 			// Skip the grpc repo. It's only for reviews
 			// for now (using LetsUseGerrit).
 			continue
 		}
+		commitTime[br.Revision] = br.Date
+		commitBranch[br.Revision] = br.Branch
 		awaitSnapshot := false
 		if br.Repo == "go" {
 			if br.Branch == "master" {
@@ -940,18 +1012,18 @@ func findWork(work chan<- buildgo.BuilderRev) error {
 					SubName: br.Repo,
 					SubRev:  br.Revision,
 				}
-				if awaitSnapshot && !rev.SnapshotExists(context.TODO(), buildEnv) {
+				if awaitSnapshot &&
+					// If this is a builder that snapshots after
+					// make.bash but the snapshot doesn't yet exist,
+					// then skip. But some builders on slow networks
+					// don't snapshot, so don't wait for them. They'll
+					// need to run make.bash first for x/ repos tests.
+					!builderInfo.SkipSnapshot && !rev.SnapshotExists(context.TODO(), buildEnv) {
 					continue
 				}
 			}
 
-			// The !sent[builder] here is a clumsy attempt at priority scheduling
-			// and probably should be replaced at some point with a better solution.
-			// See golang.org/issue/19178 and the long comment above.
-			if !isBuilding(rev) && !sent[builder] {
-				sent[builder] = true
-				work <- rev
-			}
+			add(rev)
 		}
 	}
 
@@ -963,10 +1035,7 @@ func findWork(work chan<- buildgo.BuilderRev) error {
 			continue
 		}
 		for _, rev := range goRevisions {
-			br := buildgo.BuilderRev{Name: b, Rev: rev}
-			if !isBuilding(br) {
-				work <- br
-			}
+			add(buildgo.BuilderRev{Name: b, Rev: rev})
 		}
 	}
 	return nil
@@ -1009,8 +1078,7 @@ func findTryWork() error {
 			log.Printf("Warning: skipping incomplete %#v", work)
 			continue
 		}
-		if work.Project == "grpc-review" {
-			// Skip grpc-review, which is only for reviews for now.
+		if r, ok := repos.ByGerritProject[work.Project]; !ok || !r.CoordinatorCanBuild {
 			continue
 		}
 		key := tryWorkItemKey(work)
@@ -1064,9 +1132,10 @@ type trySet struct {
 	// wanted.
 	wantedAsOf time.Time
 
-	// mu guards state and errMsg
+	// mu guards the following fields.
 	// See LOCK ORDER comment above.
-	mu sync.Mutex
+	mu       sync.Mutex
+	canceled bool // try run is no longer wanted and its builds were canceled
 	trySetState
 	errMsg bytes.Buffer
 }
@@ -1175,7 +1244,7 @@ func newTrySet(work *apipb.GerritTryWorkItem) *trySet {
 			continue
 		}
 		brev := tryKeyToBuilderRev(bconf.Name, key, goRev)
-		bs, err := newBuild(brev)
+		bs, err := newBuild(brev, noCommitDetail)
 		if err != nil {
 			log.Printf("can't create build for %q: %v", brev, err)
 			continue
@@ -1205,7 +1274,7 @@ func newTrySet(work *apipb.GerritTryWorkItem) *trySet {
 				continue
 			}
 			brev := tryKeyToBuilderRev(linuxBuilder.Name, key, goRev)
-			bs, err := newBuild(brev)
+			bs, err := newBuild(brev, noCommitDetail)
 			if err != nil {
 				log.Printf("can't create build for %q: %v", brev, err)
 				continue
@@ -1236,9 +1305,9 @@ func newTrySet(work *apipb.GerritTryWorkItem) *trySet {
 				SubName: project,
 				SubRev:  rev,
 			}
-			bs, err := newBuild(brev)
+			bs, err := newBuild(brev, noCommitDetail)
 			if err != nil {
-				log.Printf("can't create build for %q: %v", rev, err)
+				log.Printf("can't create x/%s trybot build for go/master commit %s: %v", project, rev, err)
 				return nil
 			}
 			addBuilderToSet(bs, brev)
@@ -1353,7 +1422,7 @@ func (ts *trySet) awaitTryBuild(idx int, bs *buildStatus, brev buildgo.BuilderRe
 		if !ts.wanted() {
 			return
 		}
-		bs, _ = newBuild(brev)
+		bs, _ = newBuild(brev, noCommitDetail)
 		bs.trySet = ts
 		bs.goBranch = old.goBranch
 		go bs.start()
@@ -1377,7 +1446,19 @@ func (ts *trySet) wanted() bool {
 // cancelBuilds run in its own goroutine and cancels this trySet's
 // currently-active builds because they're no longer wanted.
 func (ts *trySet) cancelBuilds() {
-	// TODO(bradfitz): implement
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	// Only cancel the builds once. And note that they're canceled so we
+	// can avoid spamming Gerrit later if they come back as failed.
+	if ts.canceled {
+		return
+	}
+	ts.canceled = true
+
+	for _, bs := range ts.builds {
+		go bs.cancelBuild()
+	}
 }
 
 func (ts *trySet) noteBuildComplete(bs *buildStatus) {
@@ -1400,7 +1481,13 @@ func (ts *trySet) noteBuildComplete(bs *buildStatus) {
 	}
 	numFail := len(ts.failed)
 	benchResults := append([]string(nil), ts.benchResults...)
+	canceled := ts.canceled
 	ts.mu.Unlock()
+
+	if canceled {
+		// Be quiet and don't spam Gerrit.
+		return
+	}
 
 	const failureFooter = "Consult https://build.golang.org/ to see whether they are new failures. Keep in mind that TryBots currently test *exactly* your git commit, without rebasing. If your commit's git parent is old, the failure might've already been fixed."
 
@@ -1506,10 +1593,6 @@ type logger interface {
 // buildletTimeoutOpt is a context.Value key for BuildletPool.GetBuildlet.
 type buildletTimeoutOpt struct{} // context Value key; value is time.Duration
 
-// highPriorityOpt is a context.Value key for BuildletPool.GetBuildlet.
-// If its value is true, that means the caller should be prioritized.
-type highPriorityOpt struct{} // value is bool
-
 type BuildletPool interface {
 	// GetBuildlet returns a new buildlet client.
 	//
@@ -1524,18 +1607,12 @@ type BuildletPool interface {
 	// and highPriorityOpt.
 	GetBuildlet(ctx context.Context, hostType string, lg logger) (*buildlet.Client, error)
 
-	// HasCapacity reports whether the buildlet pool has
-	// quota/capacity to create a buildlet of the provided host
-	// type. This should return as fast as possible and err on
-	// the side of returning false.
-	HasCapacity(hostType string) bool
-
 	String() string // TODO(bradfitz): more status stuff
 }
 
-// GetBuildlets creates up to n buildlets and sends them on the returned channel
+// getBuildlets creates up to n buildlets and sends them on the returned channel
 // before closing the channel.
-func GetBuildlets(ctx context.Context, pool BuildletPool, n int, hostType string, lg logger) <-chan *buildlet.Client {
+func getBuildlets(ctx context.Context, n int, schedTmpl *SchedItem, lg logger) <-chan *buildlet.Client {
 	ch := make(chan *buildlet.Client) // NOT buffered
 	var wg sync.WaitGroup
 	wg.Add(n)
@@ -1543,11 +1620,13 @@ func GetBuildlets(ctx context.Context, pool BuildletPool, n int, hostType string
 		go func(i int) {
 			defer wg.Done()
 			sp := lg.CreateSpan("get_helper", fmt.Sprintf("helper %d/%d", i+1, n))
-			bc, err := pool.GetBuildlet(ctx, hostType, lg)
+			schedItem := *schedTmpl // copy; GetBuildlet takes ownership
+			schedItem.IsHelper = i > 0
+			bc, err := sched.GetBuildlet(ctx, &schedItem)
 			sp.Done(err)
 			if err != nil {
 				if err != context.Canceled {
-					log.Printf("failed to get a %s buildlet: %v", hostType, err)
+					log.Printf("failed to get a %s buildlet: %v", schedItem.HostType, err)
 				}
 				return
 			}
@@ -1568,11 +1647,14 @@ func GetBuildlets(ctx context.Context, pool BuildletPool, n int, hostType string
 	return ch
 }
 
-var testPoolHook func(*dashboard.BuildConfig) BuildletPool
+var testPoolHook func(*dashboard.HostConfig) BuildletPool
 
-func poolForConf(conf *dashboard.BuildConfig) BuildletPool {
+func poolForConf(conf *dashboard.HostConfig) BuildletPool {
 	if testPoolHook != nil {
 		return testPoolHook(conf)
+	}
+	if conf == nil {
+		panic("nil conf")
 	}
 	switch {
 	case conf.IsVM():
@@ -1583,14 +1665,19 @@ func poolForConf(conf *dashboard.BuildConfig) BuildletPool {
 		} else {
 			return kubePool
 		}
-	case conf.IsReverse():
+	case conf.IsReverse:
 		return reversePool
 	default:
-		panic(fmt.Sprintf("no buildlet pool for builder type %q", conf.Name))
+		panic(fmt.Sprintf("no buildlet pool for host type %q", conf.HostType))
 	}
 }
 
-func newBuild(rev buildgo.BuilderRev) (*buildStatus, error) {
+// noCommitDetail is just a nice name for nil at call sites.
+var noCommitDetail *commitDetail = nil
+
+// newBuild constructs a new *buildStatus from rev and an optional detail.
+// If detail is nil, the scheduler just has less information to work with.
+func newBuild(rev buildgo.BuilderRev, detail *commitDetail) (*buildStatus, error) {
 	// Note: can't acquire statusMu in newBuild, as this is called
 	// from findTryWork -> newTrySet, which holds statusMu.
 
@@ -1598,6 +1685,23 @@ func newBuild(rev buildgo.BuilderRev) (*buildStatus, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown builder type %q", rev.Name)
 	}
+	if rev.Rev == "" {
+		return nil, fmt.Errorf("required field Rev is empty; got %+v", rev)
+	}
+
+	var branch string
+	var commitTime time.Time
+	if detail != nil {
+		branch = detail.Branch
+		if detail.CommitTime != "" {
+			var err error
+			commitTime, err = time.Parse(time.RFC3339, detail.CommitTime)
+			if err != nil {
+				return nil, fmt.Errorf("invalid commit time %q, for %+v: %err", detail.CommitTime, rev, err)
+			}
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	return &buildStatus{
 		buildID:    "B" + randHex(9),
@@ -1606,6 +1710,8 @@ func newBuild(rev buildgo.BuilderRev) (*buildStatus, error) {
 		startTime:  time.Now(),
 		ctx:        ctx,
 		cancel:     cancel,
+		commitTime: commitTime,
+		branch:     branch,
 	}, nil
 }
 
@@ -1631,7 +1737,7 @@ func (st *buildStatus) start() {
 }
 
 func (st *buildStatus) buildletPool() BuildletPool {
-	return poolForConf(st.conf)
+	return poolForConf(st.conf.HostConfig())
 }
 
 // parentRev returns the parent of this build's commit (but only if this build comes from a trySet).
@@ -1711,8 +1817,14 @@ func (st *buildStatus) getHelpers() <-chan *buildlet.Client {
 }
 
 func (st *buildStatus) onceInitHelpersFunc() {
-	pool := st.buildletPool()
-	st.helpers = GetBuildlets(st.ctx, pool, st.conf.NumTestHelpers(st.isTry()), st.conf.HostType, st)
+	schedTmpl := &SchedItem{
+		BuilderRev: st.BuilderRev,
+		HostType:   st.conf.HostType,
+		IsTry:      st.isTry(),
+		CommitTime: st.commitTime,
+		Branch:     st.branch,
+	}
+	st.helpers = getBuildlets(st.ctx, st.conf.NumTestHelpers(st.isTry()), schedTmpl, st)
 }
 
 // useSnapshot reports whether this type of build uses a snapshot of
@@ -1788,6 +1900,36 @@ func (st *buildStatus) checkDep(ctx context.Context, dep string) (have bool, err
 
 var errSkipBuildDueToDeps = errors.New("build was skipped due to missing deps")
 
+func (st *buildStatus) getBuildlet() (*buildlet.Client, error) {
+	schedItem := &SchedItem{
+		HostType:   st.conf.HostType,
+		IsTry:      st.trySet != nil,
+		BuilderRev: st.BuilderRev,
+		CommitTime: st.commitTime,
+		Branch:     st.branch,
+	}
+	st.mu.Lock()
+	st.schedItem = schedItem
+	st.mu.Unlock()
+
+	sp := st.CreateSpan("get_buildlet")
+	bc, err := sched.GetBuildlet(st.ctx, schedItem)
+	sp.Done(err)
+	if err != nil {
+		err = fmt.Errorf("failed to get a buildlet: %v", err)
+		go st.reportErr(err)
+		return nil, err
+	}
+	atomic.StoreInt32(&st.hasBuildlet, 1)
+
+	st.mu.Lock()
+	st.bc = bc
+	st.mu.Unlock()
+	st.LogEventTime("using_buildlet", bc.IPPort())
+
+	return bc, nil
+}
+
 func (st *buildStatus) build() error {
 	if deps := st.conf.GoDeps; len(deps) > 0 {
 		ctx, cancel := context.WithTimeout(st.ctx, 30*time.Second)
@@ -1824,31 +1966,15 @@ func (st *buildStatus) build() error {
 		st.forceSnapshotUsage()
 	}
 
-	sp = st.CreateSpan("get_buildlet")
-	pool := st.buildletPool()
-	bc, err := sched.GetBuildlet(st.ctx, st, &SchedItem{
-		HostType:   st.conf.HostType,
-		IsTry:      st.trySet != nil,
-		Pool:       pool,
-		BuilderRev: st.BuilderRev,
-	})
-	sp.Done(err)
+	bc, err := st.getBuildlet()
 	if err != nil {
-		err = fmt.Errorf("failed to get a buildlet: %v", err)
-		go st.reportErr(err)
 		return err
 	}
-	atomic.StoreInt32(&st.hasBuildlet, 1)
 	defer bc.Close()
-	st.mu.Lock()
-	st.bc = bc
-	st.mu.Unlock()
-
-	st.LogEventTime("using_buildlet", bc.IPPort())
 
 	if st.useSnapshot() {
 		sp := st.CreateSpan("write_snapshot_tar")
-		if err := bc.PutTarFromURL(st.SnapshotURL(buildEnv), "go"); err != nil {
+		if err := bc.PutTarFromURL(st.ctx, st.SnapshotURL(buildEnv), "go"); err != nil {
 			return sp.Done(fmt.Errorf("failed to put snapshot to buildlet: %v", err))
 		}
 		sp.Done(nil)
@@ -1939,6 +2065,21 @@ func (st *buildStatus) build() error {
 	return nil
 }
 
+func (st *buildStatus) HasBuildlet() bool { return atomic.LoadInt32(&st.hasBuildlet) != 0 }
+
+// useKeepGoingFlag reports whether this build should use -k flag of 'go tool
+// dist test', which makes it keep going even when some tests have failed.
+func (st *buildStatus) useKeepGoingFlag() bool {
+	// For now, keep going for post-submit builders on release branches,
+	// because we prioritize seeing more complete test results over failing fast.
+	// Later on, we may start doing this all post-submit builders on all branches.
+	// See golang.org/issue/14305.
+	//
+	// TODO(golang.org/issue/36181): A more ideal long term solution is one that reports
+	// a failure fast, but still keeps going to make all other test results available.
+	return !st.isTry() && strings.HasPrefix(st.branch, "release-branch.go")
+}
+
 func (st *buildStatus) isTry() bool { return st.trySet != nil }
 
 func (st *buildStatus) isSlowBot() bool {
@@ -1970,7 +2111,7 @@ func (st *buildStatus) buildRecord() *types.BuildRecord {
 
 	// Log whether we used COS, so we can do queries to analyze
 	// Kubernetes vs COS performance for containers.
-	if st.conf.IsContainer() && poolForConf(st.conf) == gcePool {
+	if st.conf.IsContainer() && poolForConf(st.conf.HostConfig()) == gcePool {
 		rec.ContainerHost = "cos"
 	}
 
@@ -2041,7 +2182,7 @@ func (st *buildStatus) runAllSharded() (remoteErr, err error) {
 	st.getHelpersReadySoon()
 
 	if !st.useSnapshot() {
-		remoteErr, err = st.goBuilder().RunMake(st.bc, st)
+		remoteErr, err = st.goBuilder().RunMake(st.ctx, st.bc, st)
 		if err != nil {
 			return nil, err
 		}
@@ -2086,11 +2227,12 @@ func (st *buildStatus) crossCompileMakeAndSnapshot(config *dashboard.CrossCompil
 	ctx, cancel := context.WithCancel(st.ctx)
 	defer cancel()
 	sp := st.CreateSpan("get_buildlet_cross")
-	kubeBC, err := sched.GetBuildlet(ctx, st, &SchedItem{
+	kubeBC, err := sched.GetBuildlet(ctx, &SchedItem{
 		HostType:   config.CompileHostType,
 		IsTry:      st.trySet != nil,
-		Pool:       kubePool,
 		BuilderRev: st.BuilderRev,
+		CommitTime: st.commitTime,
+		Branch:     st.branch,
 	})
 	sp.Done(err)
 	if err != nil {
@@ -2109,7 +2251,7 @@ func (st *buildStatus) crossCompileMakeAndSnapshot(config *dashboard.CrossCompil
 
 	goos, goarch := st.conf.GOOS(), st.conf.GOARCH()
 
-	remoteErr, err := kubeBC.Exec("/bin/bash", buildlet.ExecOpts{
+	remoteErr, err := kubeBC.Exec(st.ctx, "/bin/bash", buildlet.ExecOpts{
 		SystemLevel: true,
 		Args: []string{
 			"-c",
@@ -2156,7 +2298,7 @@ func (st *buildStatus) crossCompileMakeAndSnapshot(config *dashboard.CrossCompil
 func (st *buildStatus) runAllLegacy() (remoteErr, err error) {
 	allScript := st.conf.AllScript()
 	sp := st.CreateSpan("legacy_all_path", allScript)
-	remoteErr, err = st.bc.Exec(path.Join("go", allScript), buildlet.ExecOpts{
+	remoteErr, err = st.bc.Exec(st.ctx, path.Join("go", allScript), buildlet.ExecOpts{
 		Output:   st,
 		ExtraEnv: st.conf.Env(),
 		Debug:    true,
@@ -2198,7 +2340,7 @@ func (st *buildStatus) writeGoSource() error {
 func (st *buildStatus) writeGoSourceTo(bc *buildlet.Client) error {
 	// Write the VERSION file.
 	sp := st.CreateSpan("write_version_tar")
-	if err := bc.PutTar(buildgo.VersionTgz(st.Rev), "go"); err != nil {
+	if err := bc.PutTar(st.ctx, buildgo.VersionTgz(st.Rev), "go"); err != nil {
 		return sp.Done(fmt.Errorf("writing VERSION tgz: %v", err))
 	}
 
@@ -2207,7 +2349,7 @@ func (st *buildStatus) writeGoSourceTo(bc *buildlet.Client) error {
 		return err
 	}
 	sp = st.CreateSpan("write_go_src_tar")
-	if err := bc.PutTar(srcTar, "go"); err != nil {
+	if err := bc.PutTar(st.ctx, srcTar, "go"); err != nil {
 		return sp.Done(fmt.Errorf("writing tarball from Gerrit: %v", err))
 	}
 	return sp.Done(nil)
@@ -2220,12 +2362,12 @@ func (st *buildStatus) writeBootstrapToolchain() error {
 	}
 	const bootstrapDir = "go1.4" // might be newer; name is the default
 	sp := st.CreateSpan("write_go_bootstrap_tar")
-	return sp.Done(st.bc.PutTarFromURL(u, bootstrapDir))
+	return sp.Done(st.bc.PutTarFromURL(st.ctx, u, bootstrapDir))
 }
 
 func (st *buildStatus) cleanForSnapshot(bc *buildlet.Client) error {
 	sp := st.CreateSpan("clean_for_snapshot")
-	return sp.Done(bc.RemoveAll(
+	return sp.Done(bc.RemoveAll(st.ctx,
 		"go/doc/gopher",
 		"go/pkg/bootstrap",
 	))
@@ -2238,7 +2380,7 @@ func (st *buildStatus) writeSnapshot(bc *buildlet.Client) (err error) {
 	// a couple times at 1 minute. Some buildlets might be far
 	// away on the network, so be more lenient. The timeout mostly
 	// is here to prevent infinite hangs.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(st.ctx, 5*time.Minute)
 	defer cancel()
 
 	tsp := st.CreateSpan("fetch_snapshot_reader_from_buildlet")
@@ -2276,7 +2418,7 @@ func (st *buildStatus) reportErr(err error) {
 }
 
 func (st *buildStatus) distTestList() (names []string, remoteErr, err error) {
-	workDir, err := st.bc.WorkDir()
+	workDir, err := st.bc.WorkDir(st.ctx)
 	if err != nil {
 		err = fmt.Errorf("distTestList, WorkDir: %v", err)
 		return
@@ -2291,7 +2433,7 @@ func (st *buildStatus) distTestList() (names []string, remoteErr, err error) {
 		args = append(args, "--compile-only")
 	}
 	var buf bytes.Buffer
-	remoteErr, err = st.bc.Exec("go/bin/go", buildlet.ExecOpts{
+	remoteErr, err = st.bc.Exec(st.ctx, "go/bin/go", buildlet.ExecOpts{
 		Output:      &buf,
 		ExtraEnv:    append(st.conf.Env(), "GOROOT="+goroot),
 		OnStartExec: func() { st.LogEventTime("discovering_tests") },
@@ -2422,7 +2564,7 @@ func getTestStats(sl spanlog.Logger) *buildstats.TestStats {
 func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 	st.LogEventTime("fetching_subrepo", st.SubName)
 
-	workDir, err := st.bc.WorkDir()
+	workDir, err := st.bc.WorkDir(st.ctx)
 	if err != nil {
 		err = fmt.Errorf("error discovering workdir for helper %s: %v", st.bc.IPPort(), err)
 		return nil, err
@@ -2432,7 +2574,7 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 
 	// Check out the provided sub-repo to the buildlet's workspace.
 	// Need to do this first, so we can run go env GOMOD in it.
-	err = buildgo.FetchSubrepo(st, st.bc, st.SubName, st.SubRev)
+	err = buildgo.FetchSubrepo(st.ctx, st, st.bc, st.SubName, st.SubRev, importPathOfRepo(st.SubName))
 	if err != nil {
 		return nil, err
 	}
@@ -2473,7 +2615,7 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 		// Look for inner modules, in order to test them too. See golang.org/issue/32528.
 		repoPath := importPathOfRepo(st.SubName)
 		sp := st.CreateSpan("listing_subrepo_modules", st.SubName)
-		err = st.bc.ListDir("gopath/src/"+repoPath, buildlet.ListDirOpts{Recursive: true}, func(e buildlet.DirEntry) {
+		err = st.bc.ListDir(st.ctx, "gopath/src/"+repoPath, buildlet.ListDirOpts{Recursive: true}, func(e buildlet.DirEntry) {
 			goModFile := path.Base(e.Name()) == "go.mod" && !e.IsDir()
 			if !goModFile {
 				return
@@ -2514,7 +2656,7 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 		repoPath := importPathOfRepo(st.SubName)
 		var buf bytes.Buffer
 		sp := st.CreateSpan("listing_subrepo_packages", st.SubName)
-		rErr, err := st.bc.Exec("go/bin/go", buildlet.ExecOpts{
+		rErr, err := st.bc.Exec(st.ctx, "go/bin/go", buildlet.ExecOpts{
 			Output:   &buf,
 			Dir:      "gopath/src/" + repoPath,
 			ExtraEnv: append(st.conf.Env(), "GOROOT="+goroot, "GOPATH="+gopath),
@@ -2561,7 +2703,7 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 
 	var remoteErrors []error
 	for _, tr := range testRuns {
-		rErr, err := st.bc.Exec("go/bin/go", buildlet.ExecOpts{
+		rErr, err := st.bc.Exec(st.ctx, "go/bin/go", buildlet.ExecOpts{
 			Debug:    true, // make buildlet print extra debug in output for failures
 			Output:   st,
 			Dir:      tr.Dir,
@@ -2591,7 +2733,7 @@ func (st *buildStatus) runSubrepoTests() (remoteErr, err error) {
 // It uses module-specific environment variables from st.conf.ModulesEnv.
 func (st *buildStatus) goMod(importPath, goroot, gopath string) (string, error) {
 	var buf bytes.Buffer
-	rErr, err := st.bc.Exec("go/bin/go", buildlet.ExecOpts{
+	rErr, err := st.bc.Exec(st.ctx, "go/bin/go", buildlet.ExecOpts{
 		Output:   &buf,
 		Dir:      "gopath/src/" + importPath,
 		ExtraEnv: append(append(st.conf.Env(), "GOROOT="+goroot, "GOPATH="+gopath), st.conf.ModulesEnv(st.SubName)...),
@@ -2626,7 +2768,7 @@ func (st *buildStatus) fetchDependenciesToGOPATHWorkspace(goroot, gopath string)
 	// fetch checks out the provided sub-repo to the buildlet's workspace.
 	fetch := func(repo, rev string) error {
 		fetched[repo] = true
-		return buildgo.FetchSubrepo(st, st.bc, repo, rev)
+		return buildgo.FetchSubrepo(st.ctx, st, st.bc, repo, rev, importPathOfRepo(repo))
 	}
 
 	// findDeps uses 'go list' on the checked out repo to find its
@@ -2634,7 +2776,7 @@ func (st *buildStatus) fetchDependenciesToGOPATHWorkspace(goroot, gopath string)
 	findDeps := func(repo string) (rErr, err error) {
 		repoPath := importPathOfRepo(repo)
 		var buf bytes.Buffer
-		rErr, err = st.bc.Exec("go/bin/go", buildlet.ExecOpts{
+		rErr, err = st.bc.Exec(st.ctx, "go/bin/go", buildlet.ExecOpts{
 			Output:   &buf,
 			Dir:      "gopath/src/" + repoPath,
 			ExtraEnv: append(st.conf.Env(), "GOROOT="+goroot, "GOPATH="+gopath),
@@ -2836,7 +2978,7 @@ func (st *buildStatus) runTests(helpers <-chan *buildlet.Client) (remoteErr, err
 		if rev == "" {
 			rev = "master" // should happen rarely; ok if it does.
 		}
-		b, err := st.goBuilder().EnumerateBenchmarks(st.bc, rev, st.trySet.affectedPkgs())
+		b, err := st.goBuilder().EnumerateBenchmarks(st.ctx, st.bc, rev, st.trySet.affectedPkgs())
 		sp.Done(err)
 		if err == nil {
 			benches = b
@@ -2852,7 +2994,7 @@ func (st *buildStatus) runTests(helpers <-chan *buildlet.Client) (remoteErr, err
 	st.LogEventTime("starting_tests", fmt.Sprintf("%d tests", len(set.items)))
 	startTime := time.Now()
 
-	workDir, err := st.bc.WorkDir()
+	workDir, err := st.bc.WorkDir(st.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error discovering workdir for main buildlet, %s: %v", st.bc.Name(), err)
 	}
@@ -2897,11 +3039,11 @@ func (st *buildStatus) runTests(helpers <-chan *buildlet.Client) (remoteErr, err
 					defer st.LogEventTime("DEV_HELPER_SLEEP", bc.Name())
 				}
 				st.LogEventTime("got_empty_test_helper", bc.String())
-				if err := bc.PutTarFromURL(st.SnapshotURL(buildEnv), "go"); err != nil {
+				if err := bc.PutTarFromURL(st.ctx, st.SnapshotURL(buildEnv), "go"); err != nil {
 					log.Printf("failed to extract snapshot for helper %s: %v", bc.Name(), err)
 					return
 				}
-				workDir, err := bc.WorkDir()
+				workDir, err := bc.WorkDir(st.ctx)
 				if err != nil {
 					log.Printf("error discovering workdir for helper %s: %v", bc.Name(), err)
 					return
@@ -3115,16 +3257,23 @@ func (st *buildStatus) runTestsOnBuildlet(bc *buildlet.Client, tis []*testItem, 
 	if st.conf.CompileOnly {
 		args = append(args, "--compile-only")
 	}
+	if st.useKeepGoingFlag() {
+		args = append(args, "-k")
+	}
 	args = append(args, names...)
 	var buf bytes.Buffer
 	t0 := time.Now()
 	timeout := st.conf.DistTestsExecTimeout(names)
+
+	ctx, cancel := context.WithTimeout(st.ctx, timeout)
+	defer cancel()
+
 	var remoteErr, err error
 	if ti := tis[0]; ti.bench != nil {
 		pbr, perr := st.parentRev()
 		// TODO(quentin): Error if parent commit could not be determined?
 		if perr == nil {
-			remoteErr, err = ti.bench.Run(buildEnv, st, st.conf, bc, &buf, []buildgo.BuilderRev{st.BuilderRev, pbr})
+			remoteErr, err = ti.bench.Run(st.ctx, buildEnv, st, st.conf, bc, &buf, []buildgo.BuilderRev{st.BuilderRev, pbr})
 		}
 	} else {
 		env := append(st.conf.Env(),
@@ -3134,7 +3283,7 @@ func (st *buildStatus) runTestsOnBuildlet(bc *buildlet.Client, tis []*testItem, 
 		)
 		env = append(env, st.conf.ModulesEnv("go")...)
 
-		remoteErr, err = bc.Exec("go/bin/go", buildlet.ExecOpts{
+		remoteErr, err = bc.Exec(ctx, "go/bin/go", buildlet.ExecOpts{
 			// We set Dir to "." instead of the default ("go/bin") so when the dist tests
 			// try to run os/exec.Command("go", "test", ...), the LookPath of "go" doesn't
 			// return "./go.exe" (which exists in the current directory: "go/bin") and then
@@ -3144,7 +3293,6 @@ func (st *buildStatus) runTestsOnBuildlet(bc *buildlet.Client, tis []*testItem, 
 			Dir:      ".",
 			Output:   &buf, // see "maybe stream lines" TODO below
 			ExtraEnv: env,
-			Timeout:  timeout,
 			Path:     []string{"$WORKDIR/go/bin", "$PATH"},
 			Args:     args,
 		})
@@ -3340,19 +3488,21 @@ func (s byTestDuration) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 type eventAndTime struct {
 	t    time.Time
-	evt  string
-	text string
+	evt  string // "get_source", "make_and_test", "make", etc
+	text string // optional detail text
 }
 
 // buildStatus is the status of a build.
 type buildStatus struct {
 	// Immutable:
 	buildgo.BuilderRev
-	buildID   string // "B" + 9 random hex
-	goBranch  string // non-empty for subrepo trybots if not go master branch
-	conf      *dashboard.BuildConfig
-	startTime time.Time // actually time of newBuild (~same thing); TODO(bradfitz): rename this createTime
-	trySet    *trySet   // or nil
+	buildID    string // "B" + 9 random hex
+	goBranch   string // non-empty for subrepo trybots if not go master branch
+	conf       *dashboard.BuildConfig
+	startTime  time.Time // actually time of newBuild (~same thing)
+	trySet     *trySet   // or nil
+	commitTime time.Time // non-zero for post-submit builders; max of Rev & SubRev's committer time
+	branch     string    // non-empty for post-submit work
 
 	onceInitHelpers sync.Once // guards call of onceInitHelpersFunc
 	helpers         <-chan *buildlet.Client
@@ -3364,40 +3514,77 @@ type buildStatus struct {
 	hasBenchResults bool // set by runTests, may only be used when build() returns.
 
 	mu              sync.Mutex       // guards following
+	canceled        bool             // whether this build was forcefully canceled, so errors should be ignored
+	schedItem       *SchedItem       // for the initial buildlet (ignoring helpers for now)
 	logURL          string           // if non-empty, permanent URL of log
 	bc              *buildlet.Client // nil initially, until pool returns one
 	done            time.Time        // finished running
 	succeeded       bool             // set when done
 	output          livelog.Buffer   // stdout and stderr
-	startedPinging  bool             // started pinging the go dashboard
 	events          []eventAndTime
 	useSnapshotMemo *bool // if non-nil, memoized result of useSnapshot
 }
 
 func (st *buildStatus) NameAndBranch() string {
+	result := st.Name
 	if st.goBranch != "" {
 		// For the common and currently-only case of
 		// "release-branch.go1.15" say "linux-amd64 (Go 1.15.x)"
 		const releasePrefix = "release-branch.go"
 		if strings.HasPrefix(st.goBranch, releasePrefix) {
-			return fmt.Sprintf("%s (Go %s.x)", st.Name, strings.TrimPrefix(st.goBranch, releasePrefix))
+			result = fmt.Sprintf("%s (Go %s.x)", st.Name, strings.TrimPrefix(st.goBranch, releasePrefix))
+		} else {
+			// But if we ever support building other branches,
+			// fall back to something verbose until we add a
+			// special case:
+			result = fmt.Sprintf("%s (go branch %s)", st.Name, st.goBranch)
 		}
-		// But if we ever support building other branches,
-		// fall back to something verbose until we add a
-		// special case:
-		return fmt.Sprintf("%s (go branch %s)", st.Name, st.goBranch)
 	}
-	// For an x repo running on a go CL, say
-	// "x/tools (linux-amd64)"
-	if st.SubName != "" {
-		return fmt.Sprintf("x/%s (%s)", st.SubName, st.Name)
+	// For an x repo running on a CL in a different repo,
+	// add a prefix specifying the name of the x repo.
+	if st.SubName != "" && st.trySet != nil && st.SubName != st.trySet.Project {
+		result = "(x/" + st.SubName + ") " + result
 	}
-	return st.Name
+	return result
+}
+
+// cancelBuild marks a build as no longer wanted, cancels its context,
+// and tears down its buildlet.
+func (st *buildStatus) cancelBuild() {
+	st.mu.Lock()
+	if st.canceled {
+		// Already done. Shouldn't happen currently, but make
+		// it safe for duplicate calls in the future.
+		st.mu.Unlock()
+		return
+	}
+
+	st.canceled = true
+	st.output.Close()
+	// cancel the context, which stops the creation of helper
+	// buildlets, etc. The context isn't plumbed everywhere yet,
+	// so we also forcefully close its buildlet out from under it
+	// to trigger a failure. When we get the failure later, we
+	// just ignore it (knowing that the canceled bit was set
+	// true).
+	st.cancel()
+	bc := st.bc
+	st.mu.Unlock()
+
+	if bc != nil {
+		// closing the buildlet may be slow (up to ~10 seconds
+		// on a wedged buildlet) so run it in its own
+		// goroutine so we're not holding st.mu for too long.
+		bc.Close()
+	}
 }
 
 func (st *buildStatus) setDone(succeeded bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if st.canceled {
+		return
+	}
 	st.succeeded = succeeded
 	st.done = time.Now()
 	st.output.Close()
@@ -3484,13 +3671,6 @@ func (st *buildStatus) LogEventTime(event string, optText ...string) {
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	switch event {
-	case "finish_get_buildlet", "create_gce_buildlet":
-		if !st.startedPinging {
-			st.startedPinging = true
-			go st.pingDashboard()
-		}
-	}
 	var text string
 	if len(optText) > 0 {
 		text = optText[0]
@@ -3515,10 +3695,26 @@ func (st *buildStatus) hasEvent(event string) bool {
 
 // HTMLStatusLine returns the HTML to show within the <pre> block on
 // the main page's list of active builds.
-func (st *buildStatus) HTMLStatusLine() template.HTML      { return st.htmlStatusLine(true) }
-func (st *buildStatus) HTMLStatusLine_done() template.HTML { return st.htmlStatusLine(false) }
+func (st *buildStatus) HTMLStatusLine() template.HTML      { return st.htmlStatus(singleLine) }
+func (st *buildStatus) HTMLStatusTruncated() template.HTML { return st.htmlStatus(truncated) }
+func (st *buildStatus) HTMLStatus() template.HTML          { return st.htmlStatus(full) }
 
-func (st *buildStatus) htmlStatusLine(full bool) template.HTML {
+func strSliceTo(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+type buildStatusDetail int
+
+const (
+	singleLine buildStatusDetail = iota
+	truncated
+	full
+)
+
+func (st *buildStatus) htmlStatus(detail buildStatusDetail) template.HTML {
 	if st == nil {
 		return "[nil]"
 	}
@@ -3527,28 +3723,44 @@ func (st *buildStatus) htmlStatusLine(full bool) template.HTML {
 
 	urlPrefix := "https://go-review.googlesource.com/#/q/"
 
+	if st.Rev == "" {
+		log.Printf("warning: st.Rev is empty")
+	}
+
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "<a href='https://github.com/golang/go/wiki/DashboardBuilders'>%s</a> rev <a href='%s%s'>%s</a>",
-		st.Name, urlPrefix, st.Rev, st.Rev[:8])
+		st.Name, urlPrefix, st.Rev, strSliceTo(st.Rev, 8))
 	if st.IsSubrepo() {
+		if st.SubRev == "" {
+			log.Printf("warning: st.SubRev is empty on subrepo")
+		}
 		fmt.Fprintf(&buf, " (sub-repo %s rev <a href='%s%s'>%s</a>)",
-			st.SubName, urlPrefix, st.SubRev, st.SubRev[:8])
+			st.SubName, urlPrefix, st.SubRev, strSliceTo(st.SubRev, 8))
 	}
 	if ts := st.trySet; ts != nil {
+		if ts.ChangeID == "" {
+			log.Printf("warning: ts.ChangeID is empty")
+		}
 		fmt.Fprintf(&buf, " (<a href='/try?commit=%v'>trybot set</a> for <a href='https://go-review.googlesource.com/#/q/%s'>%s</a>)",
-			ts.Commit[:8],
-			ts.ChangeTriple(), ts.ChangeID[:8])
+			strSliceTo(ts.Commit, 8),
+			ts.ChangeTriple(), strSliceTo(ts.ChangeID, 8))
 	}
 
 	var state string
-	if st.done.IsZero() {
-		state = "running"
+	if st.canceled {
+		state = "canceled"
+	} else if st.done.IsZero() {
+		if st.HasBuildlet() {
+			state = "running"
+		} else {
+			state = "waiting_for_machine"
+		}
 	} else if st.succeeded {
 		state = "succeeded"
 	} else {
 		state = "<font color='#700000'>failed</font>"
 	}
-	if full {
+	if detail > singleLine {
 		fmt.Fprintf(&buf, "; <a href='%s'>%s</a>; %s", html.EscapeString(st.logsURLLocked()), state, html.EscapeString(st.bc.String()))
 	} else {
 		fmt.Fprintf(&buf, "; <a href='%s'>%s</a>", html.EscapeString(st.logsURLLocked()), state)
@@ -3559,9 +3771,13 @@ func (st *buildStatus) htmlStatusLine(full bool) template.HTML {
 		t = st.startTime
 	}
 	fmt.Fprintf(&buf, ", %v ago", time.Since(t).Round(time.Second))
-	if full {
+	if detail > singleLine {
 		buf.WriteByte('\n')
-		st.writeEventsLocked(&buf, true)
+		lastLines := 0
+		if detail == truncated {
+			lastLines = 3
+		}
+		st.writeEventsLocked(&buf, true, lastLines)
 	}
 	return template.HTML(buf.String())
 }
@@ -3587,10 +3803,20 @@ func (st *buildStatus) logsURLLocked() string {
 }
 
 // st.mu must be held.
-func (st *buildStatus) writeEventsLocked(w io.Writer, htmlMode bool) {
-	var lastT time.Time
-	for _, evt := range st.events {
-		lastT = evt.t
+// If numLines is greater than zero, it's the number of final lines to truncate to.
+func (st *buildStatus) writeEventsLocked(w io.Writer, htmlMode bool, numLines int) {
+	startAt := 0
+	if numLines > 0 {
+		startAt = len(st.events) - numLines
+		if startAt > 0 {
+			io.WriteString(w, "...\n")
+		} else {
+			startAt = 0
+		}
+	}
+
+	for i := startAt; i < len(st.events); i++ {
+		evt := st.events[i]
 		e := evt.evt
 		text := evt.text
 		if htmlMode {
@@ -3602,8 +3828,9 @@ func (st *buildStatus) writeEventsLocked(w io.Writer, htmlMode bool) {
 		}
 		fmt.Fprintf(w, "  %v %s %s\n", evt.t.Format(time.RFC3339), e, text)
 	}
-	if st.isRunningLocked() {
-		fmt.Fprintf(w, " %7s (now)\n", fmt.Sprintf("+%0.1fs", time.Since(lastT).Seconds()))
+	if st.isRunningLocked() && len(st.events) > 0 {
+		lastEvt := st.events[len(st.events)-1]
+		fmt.Fprintf(w, " %7s (now)\n", fmt.Sprintf("+%0.1fs", time.Since(lastEvt.t).Seconds()))
 	}
 }
 
@@ -3701,18 +3928,25 @@ func randHex(n int) string {
 }
 
 // importPathOfRepo returns the Go import path corresponding to the
-// root of the given repo (Gerrit project). Because it's a Go import
-// path, it always has forward slashes and no trailing slash.
+// root of the given non-"go" repo (Gerrit project). Because it's a Go
+// import path, it always has forward slashes and no trailing slash.
 //
 // For example:
 //   "net"    -> "golang.org/x/net"
 //   "crypto" -> "golang.org/x/crypto"
 //   "dl"     -> "golang.org/dl"
 func importPathOfRepo(repo string) string {
-	if repo == "dl" {
-		return "golang.org/dl"
+	r := repos.ByGerritProject[repo]
+	if r == nil {
+		// mayBuildRev prevents adding work for repos we don't know about,
+		// so this shouldn't happen. If it does, a panic will be useful.
+		panic(fmt.Sprintf("importPathOfRepo(%q) on unknown repo %q", repo, repo))
 	}
-	return "golang.org/x/" + repo
+	if r.ImportPath == "" {
+		// Likewise. This shouldn't happen.
+		panic(fmt.Sprintf("importPathOfRepo(%q) doesn't have an ImportPath", repo))
+	}
+	return r.ImportPath
 }
 
 // slowBotsFromComments looks at the TRY= comments from Gerrit (in
@@ -3790,4 +4024,42 @@ func latestTryMessage(work *apipb.GerritTryWorkItem) string {
 		}
 	}
 	return ""
+}
+
+// handlePostSubmitActiveJSON serves JSON with the the info for which builds
+// are currently building. The build.golang.org dashboard renders these as little
+// blue gophers that link to the each build's status.
+// TODO: this a transitional step on our way towards merging build.golang.org into
+// this codebase; see https://github.com/golang/go/issues/34744#issuecomment-563398753.
+func handlePostSubmitActiveJSON(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(activePostSubmitBuilds())
+}
+
+func activePostSubmitBuilds() []types.ActivePostSubmitBuild {
+	var ret []types.ActivePostSubmitBuild
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	for _, st := range status {
+		if st.isTry() || !st.HasBuildlet() {
+			continue
+		}
+		st.mu.Lock()
+		logsURL := st.logsURLLocked()
+		st.mu.Unlock()
+
+		var commit, goCommit string
+		if st.IsSubrepo() {
+			commit, goCommit = st.SubRev, st.Rev
+		} else {
+			commit = st.Rev
+		}
+		ret = append(ret, types.ActivePostSubmitBuild{
+			StatusURL: logsURL,
+			Builder:   st.Name,
+			Commit:    commit,
+			GoCommit:  goCommit,
+		})
+	}
+	return ret
 }

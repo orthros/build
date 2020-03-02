@@ -189,16 +189,14 @@ func TestFindWork(t *testing.T) {
 		return false
 	}
 
-	c := make(chan buildgo.BuilderRev, 1000)
-	go func() {
-		defer close(c)
-		err := findWork(c)
-		if err != nil {
-			t.Error(err)
-		}
-	}()
-	for br := range c {
-		t.Logf("Got: %v", br)
+	addWorkTestHook = func(work buildgo.BuilderRev, d *commitDetail) {
+		t.Logf("Got: %v, %+v", work, d)
+	}
+	defer func() { addWorkTestHook = nil }()
+
+	err := findWork()
+	if err != nil {
+		t.Error(err)
 	}
 }
 
@@ -279,12 +277,46 @@ func TestBuildStatusFormat(t *testing.T) {
 	}{
 		{
 			st: &buildStatus{
+				trySet: &trySet{
+					tryKey: tryKey{
+						Project: "go",
+					},
+				},
 				BuilderRev: buildgo.BuilderRev{
 					Name:    "linux-amd64",
 					SubName: "tools",
 				},
 			},
-			want: "x/tools (linux-amd64)",
+			want: "(x/tools) linux-amd64",
+		},
+		{
+			st: &buildStatus{
+				trySet: &trySet{
+					tryKey: tryKey{
+						Project: "tools",
+					},
+				},
+				BuilderRev: buildgo.BuilderRev{
+					Name:    "linux-amd64",
+					SubName: "tools",
+				},
+				goBranch: "release-branch.go1.15",
+			},
+			want: "linux-amd64 (Go 1.15.x)",
+		},
+		{
+			st: &buildStatus{
+				trySet: &trySet{
+					tryKey: tryKey{
+						Project: "go",
+					},
+				},
+				BuilderRev: buildgo.BuilderRev{
+					Name:    "linux-amd64",
+					SubName: "tools",
+				},
+			},
+			want: "(x/tools) linux-amd64",
 		},
 		{
 			st: &buildStatus{

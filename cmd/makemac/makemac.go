@@ -225,20 +225,23 @@ func (st *State) CreateMac(ctx context.Context, minor int) (slotName string, err
 		// Mojave. Requires vSphere 6.7.
 		// https://www.virtuallyghetto.com/2018/04/new-vsphere-6-7-apis-worth-checking-out.html
 		guestType = "darwin18_64Guest"
+	case 15:
+		// Catalina. Requires vSphere 6.7 update 3.
+		// https://docs.macstadium.com/docs/vsphere-67-update-3
+		// vSphere 6.7 update 3 does not support the guestid `darwin19_64Guest` (which would be
+		// associated with macOS 10.15. It enables the creation of a macOS 10.15 vm via guestid
+		// `darwin18_64Guest`.
+		// TODO: Add a new GOS definition for darwin19_64 (macOS 10.15) in HWV >= 17
+		// https://github.com/vmware/open-vm-tools/commit/6297504ef9e139c68b65afe299136d041d690eeb
+		// TODO: investigate updating the guestid when we upgrade vSphere past version 6.7u3.
+		guestType = "darwin18_64Guest"
 	default:
 		return "", fmt.Errorf("unsupported makemac minor OS X version %d", minor)
 	}
 
-	builderType := fmt.Sprintf("darwin-amd64-10_%d", minor)
+	hostType := fmt.Sprintf("host-darwin-10_%d", minor)
 
-	// Up to 10.12 we used the deprecated buildlet --reverse mode, instead of --reverse-type.
-	// Starting with 10.14 (and 10.13 if we ever make a High Sierra image), we're switching
-	// to the non-deprecated mode.
-	if minor >= 13 {
-		builderType = fmt.Sprintf("host-darwin-10_%d", minor)
-	}
-
-	key, err := ioutil.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", builderType))
+	key, err := ioutil.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", hostType))
 	if err != nil {
 		return "", err
 	}
@@ -281,7 +284,7 @@ func (st *State) CreateMac(ctx context.Context, minor int) (slotName string, err
 		"-e", "smc.present=TRUE",
 		"-e", "ich7m.present=TRUE",
 		"-e", "firmware=efi",
-		"-e", fmt.Sprintf("guestinfo.key-%s=%s", builderType, strings.TrimSpace(string(key))),
+		"-e", fmt.Sprintf("guestinfo.key-%s=%s", hostType, strings.TrimSpace(string(key))),
 		"-e", "guestinfo.name="+name,
 		"-vm", name,
 	); err != nil {
@@ -702,9 +705,15 @@ func autoAdjust() {
 // or 0 to not make anything. It gets the latest reverse buildlet
 // status from the coordinator.
 func wantedMacVersionNext(st *State, rstat *types.ReverseBuilderStatus) int {
-	// TODO: improve this logic at some point, probably when the
-	// coordinator has a proper scheduler (Issue 19178) and when
-	// the coordinator keeps 1 of each builder type ready to go.
+	// TODO: improve this logic now that the coordinator has a
+	// proper scheduler. Instead, don't create anything
+	// proactively until there's demand from it from the
+	// scheduler. (will need to add that to the coordinator's
+	// status JSON) And maybe add a streaming endpoint to the
+	// coordinator so we don't need to poll every N seconds. Or
+	// just poll every few seconds, perhaps at a lighter endpoint
+	// that only does darwin.
+	//
 	// For now just use the static configuration in
 	// dashboard/builders.go of how many are expected, which ends
 	// up in ReverseBuilderStatus.

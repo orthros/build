@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package gophers is a list of names, emails, and Github usernames of people
+// Package gophers is a list of names, emails, and GitHub usernames of people
 // from the Go git repos and issue trackers.
 package gophers
 
@@ -15,7 +15,7 @@ import (
 // Person represents a person.
 type Person struct {
 	Name    string   // "Foo Bar"
-	Github  string   // "FooBar" (orig case, no '@')
+	GitHub  string   // "FooBar" (orig case, no '@')
 	Gerrit  string   // "foo@bar.com" (lowercase)
 	Emails  []string // all lower
 	Googler bool     // whether person is (or was) a Googler; determined via heuristics
@@ -35,7 +35,7 @@ func (p *Person) mergeIDs(ids ...string) {
 	for _, id := range ids {
 		switch {
 		case strings.HasPrefix(id, "@"):
-			p.Github = id[1:]
+			p.GitHub = id[1:]
 			idToPerson[strings.ToLower(id)] = p
 		case strings.Contains(id, "@"):
 			email := strings.ToLower(id)
@@ -244,6 +244,7 @@ func init() {
 	addPerson("Alexander Orlov", "alexander.orlov@loxal.net", "@loxal")
 	addPerson("Alexander Polcyn", "apolcyn@google.com", "16623@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Alexander Polcyn", "apolcyn@google.com", "@apolcyn")
+	addPerson("Alexander Rakoczy", "alex@golang.org", "rakoczy@google.com", "@toothrot", "32558@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Alexander Reece", "awreece@gmail.com", "@awreece")
 	addPerson("Alexander Shopov", "ash@kambanaria.org", "@alshopov")
 	addPerson("Alexander Zhavnerchik", "alex.vizor@gmail.com", "@alxzh")
@@ -560,6 +561,7 @@ func init() {
 	addPerson("Carlos Castillo", "cookieo9@gmail.com", "@cookieo9")
 	addPerson("Carlos Eduardo Seo", "cseo@linux.vnet.ibm.com", "13015@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Carlos Eduardo Seo", "cseo@linux.vnet.ibm.com", "@ceseo")
+	addPerson("Carmen Andoh", "@Lyoness", "candoh@google.com")
 	addPerson("Carolyn Van Slyck", "me@carolynvanslyck.com", "@carolynvs")
 	addPerson("Carrie Bynon", "cbynon@gmail.com", "@cbynon")
 	addPerson("Casey Callendrello", "squeed@gmail.com")
@@ -1722,7 +1724,6 @@ func init() {
 	addPerson("Lyle Franklin", "lylejfranklin@gmail.com", "@ljfranklin")
 	addPerson("Lynn Boger", "laboger@linux.vnet.ibm.com", "6320@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Lynn Boger", "laboger@linux.vnet.ibm.com", "@laboger")
-	addPerson("Lyoness", "carmen.andoh@gmail.com")
 	addPerson("Maarten Bezemer", "maarten.bezemer@gmail.com")
 	addPerson("Maciej Dębski", "maciejd@google.com", "26521@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Maciej Galkowski", "maciejgalkowski@gmail.com")
@@ -1853,6 +1854,7 @@ func init() {
 	addPerson("Matt Keenan", "github@mattkeenan.net", "@mattkeenan")
 	addPerson("Matt Layher", "mdlayher@gmail.com", "7860@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Matt Layher", "mdlayher@gmail.com", "@mdlayher")
+	addPerson("Matt Pearring", "@pearring")
 	addPerson("Matt Proud", "matt.proud@gmail.com", "6400@62eb7196-b449-3ce5-99f1-c037f21e1705")
 	addPerson("Matt Reiferson", "mreiferson@gmail.com", "@mreiferson")
 	addPerson("Matt Robenolt", "matt@ydekproductions.com", "@mattrobenolt")
@@ -3171,9 +3173,11 @@ func init() {
 	addPerson("祥曦 徐", "lucas1x1x@gmail.com", "28434@62eb7196-b449-3ce5-99f1-c037f21e1705")
 }
 
-// GithubOfGomoteUser returns the GitHub username for the provided gomote user.
-func GithubOfGomoteUser(gomoteUser string) (githubUser string) {
+// GitHubOfGomoteUser returns the GitHub username for the provided gomote user.
+func GitHubOfGomoteUser(gomoteUser string) (githubUser string) {
 	switch gomoteUser {
+	case "amedee":
+		return "cagedmantis"
 	case "austin":
 		return "aclements"
 	case "cbro":
@@ -3206,6 +3210,8 @@ func GithubOfGomoteUser(gomoteUser string) (githubUser string) {
 		return "pjweinbgo"
 	case "r":
 		return "robpike"
+	case "rakoczy":
+		return "toothrot"
 	case "rstambler":
 		return "stamblerre"
 	case "sameer":

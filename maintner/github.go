@@ -1090,7 +1090,7 @@ func (d githubIssueDiffer) diffBody(m *maintpb.GithubIssueMutation) bool {
 	if d.a != nil && d.a.Body == d.b.GetBody() {
 		return false
 	}
-	m.Body = d.b.GetBody()
+	m.BodyChange = &maintpb.StringChange{Val: d.b.GetBody()}
 	return true
 }
 
@@ -1099,7 +1099,11 @@ func (d githubIssueDiffer) diffTitle(m *maintpb.GithubIssueMutation) bool {
 		return false
 	}
 	m.Title = d.b.GetTitle()
-	return true
+	// TODO: emit a StringChange if we ever have a problem that we
+	// legitimately need real issues with no titles reflected in
+	// maintner's model. For now just ignore such changes, if
+	// GitHub even permits the.
+	return m.Title != ""
 }
 
 func (d githubIssueDiffer) diffMilestone(m *maintpb.GithubIssueMutation) bool {
@@ -1354,6 +1358,9 @@ func (c *Corpus) processGithubIssueMutation(m *maintpb.GithubIssueMutation) {
 
 	if m.Body != "" {
 		gi.Body = m.Body
+	}
+	if m.BodyChange != nil {
+		gi.Body = m.BodyChange.Val
 	}
 	if m.Title != "" {
 		gi.Title = m.Title
