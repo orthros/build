@@ -9,14 +9,18 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/build/gerrit"
 	"golang.org/x/build/maintner"
 	"golang.org/x/build/maintner/godata"
 	"golang.org/x/build/maintner/maintnerd/apipb"
+	"grpc.go4.org"
+	"grpc.go4.org/codes"
 )
 
 func TestGetRef(t *testing.T) {
@@ -122,13 +126,37 @@ func TestTryWorkItem(t *testing.T) {
 	tests := []struct {
 		proj  string
 		clnum int32
+		ci    *gerrit.ChangeInfo
 		want  string
 	}{
 		// Same Change-Id, different branch:
-		{"go", 51430, `project:"go" branch:"master" change_id:"I0bcae339624e7d61037d9ea0885b7bd07491bbb6" commit:"45a4609c0ae214e448612e0bc0846e2f2682f1b2" `},
-		{"go", 51450, `project:"go" branch:"release-branch.go1.9" change_id:"I0bcae339624e7d61037d9ea0885b7bd07491bbb6" commit:"7320506bc58d3a55eff2c67b2ec65cfa94f7b0a7" `},
+		{"go", 51430, nil, `project:"go" branch:"master" change_id:"I0bcae339624e7d61037d9ea0885b7bd07491bbb6" commit:"45a4609c0ae214e448612e0bc0846e2f2682f1b2" `},
+		{"go", 51450, nil, `project:"go" branch:"release-branch.go1.9" change_id:"I0bcae339624e7d61037d9ea0885b7bd07491bbb6" commit:"7320506bc58d3a55eff2c67b2ec65cfa94f7b0a7" `},
 		// Different project:
-		{"build", 51432, `project:"build" branch:"master" change_id:"I1f71836da7008e58d3e76e2cc3170e96cd57ddf6" commit:"9251bc9950baff61d95da0761e2e4bfab61ed210" `},
+		{"build", 51432, nil, `project:"build" branch:"master" change_id:"I1f71836da7008e58d3e76e2cc3170e96cd57ddf6" commit:"9251bc9950baff61d95da0761e2e4bfab61ed210" `},
+
+		// With comments:
+		{
+			proj:  "go",
+			clnum: 201203,
+			ci: &gerrit.ChangeInfo{
+				CurrentRevision: "f99d33e72efdea68fce39765bc94479b5ebed0a9",
+				Revisions: map[string]gerrit.RevisionInfo{
+					"f99d33e72efdea68fce39765bc94479b5ebed0a9": {PatchSetNumber: 88},
+				},
+				Messages: []gerrit.ChangeMessageInfo{
+					{
+						Author:  &gerrit.AccountInfo{NumericID: 1234},
+						Message: "Patch Set 1: Run-TryBot+1\n\nTRY=foo",
+					},
+					{
+						Author:  &gerrit.AccountInfo{NumericID: 5678},
+						Message: "Patch Set 2: Foo-2 Run-TryBot+1\n\nTRY=bar",
+					},
+				},
+			},
+			want: `project:"go" branch:"master" change_id:"I358eb7b11768df8c80fb7e805abd4cd01d52bb9b" commit:"f99d33e72efdea68fce39765bc94479b5ebed0a9" version:88 try_message:<message:"foo" author_id:1234 version:1 > try_message:<message:"bar" author_id:5678 version:2 > `,
+		},
 	}
 	for _, tt := range tests {
 		cl := c.Gerrit().Project("go.googlesource.com", tt.proj).CL(tt.clnum)
@@ -136,9 +164,9 @@ func TestTryWorkItem(t *testing.T) {
 			t.Errorf("CL %d in %s not found", tt.clnum, tt.proj)
 			continue
 		}
-		got := fmt.Sprint(tryWorkItem(cl))
+		got := fmt.Sprint(tryWorkItem(cl, tt.ci))
 		if got != tt.want {
-			t.Errorf("tryWorkItem(%q, %v) = %#q; want %#q", tt.proj, tt.clnum, got, tt.want)
+			t.Errorf("tryWorkItem(%q, %v) mismatch:\n got: %#q\nwant: %#q", tt.proj, tt.clnum, got, tt.want)
 		}
 	}
 }
@@ -290,6 +318,206 @@ func TestSupportedGoReleases(t *testing.T) {
 		if diff := cmp.Diff(got, tt.want); diff != "" {
 			t.Errorf("%d: supportedGoReleases: (-got +want)\n%s", i, diff)
 		}
+	}
+}
+
+func TestGetDashboard(t *testing.T) {
+	c := getGoData(t)
+	s := apiService{c}
+
+	type check func(t *testing.T, res *apipb.DashboardResponse, resErr error)
+	var noError check = func(t *testing.T, res *apipb.DashboardResponse, resErr error) {
+		t.Helper()
+		if resErr != nil {
+			t.Fatalf("GetDashboard: %v", resErr)
+		}
+	}
+	var commitsTruncated check = func(t *testing.T, res *apipb.DashboardResponse, _ error) {
+		t.Helper()
+		if !res.CommitsTruncated {
+			t.Errorf("CommitsTruncated = false; want true")
+		}
+		if len(res.Commits) == 0 {
+			t.Errorf("no commits; expected some commits when expecting CommitsTruncated")
+		}
+
+	}
+	hasBranch := func(branch string) check {
+		return func(t *testing.T, res *apipb.DashboardResponse, _ error) {
+			ok := false
+			for _, b := range res.Branches {
+				if b == branch {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				t.Errorf("didn't find expected branch %q; got branches: %q", branch, res.Branches)
+			}
+		}
+	}
+	hasRepoHead := func(proj string) check {
+		return func(t *testing.T, res *apipb.DashboardResponse, _ error) {
+			ok := false
+			var got []string
+			for _, rh := range res.RepoHeads {
+				if rh.GerritProject == proj {
+					ok = true
+				}
+				got = append(got, rh.GerritProject)
+			}
+			if !ok {
+				t.Errorf("didn't find expected repo head %q; got: %q", proj, got)
+			}
+		}
+	}
+	var hasThreeReleases check = func(t *testing.T, res *apipb.DashboardResponse, _ error) {
+		t.Helper()
+		var got []string
+		var gotMaster int
+		var gotReleaseBranch int
+		var uniq = map[string]bool{}
+		for _, r := range res.Releases {
+			got = append(got, r.BranchName)
+			uniq[r.BranchName] = true
+			if r.BranchName == "master" {
+				gotMaster++
+			}
+			if strings.HasPrefix(r.BranchName, "release-branch.go") {
+				gotReleaseBranch++
+			}
+		}
+		if len(uniq) != 3 {
+			t.Errorf("expected 3 Go releases, got: %q", got)
+		}
+		if gotMaster != 1 {
+			t.Errorf("expected 1 Go release to be master, got: %q", got)
+		}
+		if gotReleaseBranch != 2 {
+			t.Errorf("expected 2 Go releases to be release branches, got: %q", got)
+		}
+	}
+	wantRPCError := func(code codes.Code) check {
+		return func(t *testing.T, _ *apipb.DashboardResponse, err error) {
+			if grpc.Code(err) != code {
+				t.Errorf("expected RPC code %v; got %v (err %v)", code, grpc.Code(err), err)
+			}
+		}
+	}
+	basicChecks := []check{
+		noError,
+		commitsTruncated,
+		hasBranch("master"),
+		hasBranch("release-branch.go1.4"),
+		hasBranch("release-branch.go1.13"),
+		hasRepoHead("net"),
+		hasRepoHead("sys"),
+		hasThreeReleases,
+	}
+
+	tests := []struct {
+		name   string
+		req    *apipb.DashboardRequest
+		checks []check
+	}{
+		// Verify that the default view (with no options) works.
+		{
+			name:   "zero_value",
+			req:    &apipb.DashboardRequest{},
+			checks: basicChecks,
+		},
+		// Or with explicit values:
+		{
+			name: "zero_value_effectively",
+			req: &apipb.DashboardRequest{
+				Repo:   "go",
+				Branch: "master",
+			},
+			checks: basicChecks,
+		},
+		// Max commits:
+		{
+			name: "max_commits",
+			req:  &apipb.DashboardRequest{MaxCommits: 1},
+			checks: []check{
+				noError,
+				commitsTruncated,
+				func(t *testing.T, res *apipb.DashboardResponse, _ error) {
+					if got, want := len(res.Commits), 1; got != want {
+						t.Errorf("got %v commits; want %v", got, want)
+					}
+				},
+			},
+		},
+		// Verify that branch=mixed doesn't return an error at least.
+		{
+			name: "mixed",
+			req:  &apipb.DashboardRequest{Branch: "mixed"},
+			checks: []check{
+				noError,
+				commitsTruncated,
+				hasRepoHead("sys"),
+				hasThreeReleases,
+			},
+		},
+		// Verify non-Go repos:
+		{
+			name: "non_go_repo",
+			req:  &apipb.DashboardRequest{Repo: "golang.org/x/net"},
+			checks: []check{
+				noError,
+				commitsTruncated,
+				func(t *testing.T, res *apipb.DashboardResponse, _ error) {
+					for _, c := range res.Commits {
+						if c.GoCommitAtTime == "" {
+							t.Errorf("response contains commit without GoCommitAtTime")
+						}
+						if c.GoCommitLatest == "" {
+							t.Errorf("response contains commit without GoCommitLatest")
+						}
+						if t.Failed() {
+							return
+						}
+					}
+				},
+			},
+		},
+
+		// Validate rejection of bad requests:
+		{
+			name:   "bad-repo",
+			req:    &apipb.DashboardRequest{Repo: "NOT_EXIST"},
+			checks: []check{wantRPCError(codes.NotFound)},
+		},
+		{
+			name:   "bad-branch",
+			req:    &apipb.DashboardRequest{Branch: "NOT_EXIST"},
+			checks: []check{wantRPCError(codes.NotFound)},
+		},
+		{
+			name:   "mixed-with-pagination",
+			req:    &apipb.DashboardRequest{Branch: "mixed", Page: 5},
+			checks: []check{wantRPCError(codes.InvalidArgument)},
+		},
+		{
+			name:   "negative-page",
+			req:    &apipb.DashboardRequest{Page: -1},
+			checks: []check{wantRPCError(codes.InvalidArgument)},
+		},
+		{
+			name:   "too-big-page",
+			req:    &apipb.DashboardRequest{Page: 1e6},
+			checks: []check{wantRPCError(codes.InvalidArgument)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := s.GetDashboard(context.Background(), tt.req)
+			for _, c := range tt.checks {
+				c(t, res, err)
+			}
+		})
 	}
 }
 

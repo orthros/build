@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,9 @@ import (
 	"golang.org/x/build/maintner"
 	"golang.org/x/build/maintner/maintnerd/apipb"
 	"golang.org/x/build/maintner/maintnerd/maintapi/version"
+	"golang.org/x/build/repos"
+	"grpc.go4.org"
+	"grpc.go4.org/codes"
 )
 
 // NewAPIService creates a gRPC Server that serves the Maintner API for the given corpus.
@@ -95,12 +100,62 @@ func tryBotStatus(cl *maintner.GerritCL, forStaging bool) (try, done bool) {
 	return
 }
 
-func tryWorkItem(cl *maintner.GerritCL) *apipb.GerritTryWorkItem {
-	return &apipb.GerritTryWorkItem{
+var (
+	tryCommentRx = regexp.MustCompile(`(?m)^TRY=(.*)$`)
+	patchSetRx   = regexp.MustCompile(`^Patch Set (\d{1,4}):`)
+)
+
+func tryWorkItem(cl *maintner.GerritCL, ci *gerrit.ChangeInfo) *apipb.GerritTryWorkItem {
+	work := &apipb.GerritTryWorkItem{
 		Project:  cl.Project.Project(),
 		Branch:   strings.TrimPrefix(cl.Branch(), "refs/heads/"),
 		ChangeId: cl.ChangeID(),
 		Commit:   cl.Commit.Hash.String(),
+	}
+	if ci != nil {
+		if ci.CurrentRevision != "" {
+			// In case maintner is behind.
+			work.Commit = ci.CurrentRevision
+			work.Version = int32(ci.Revisions[ci.CurrentRevision].PatchSetNumber)
+		}
+		// Also include any "TRY=foo" comments (just the "foo"
+		// aprt) from messages that accompany Run-TryBot+1
+		// votes.
+		for _, m := range ci.Messages {
+			// msg is like:
+			//   "Patch Set 2: Run-TryBot+1\n\nTRY=foo2"
+			//   "Patch Set 2: Run-TryBot+1 Code-Review-2"
+			//   "Uploaded patch set 2."
+			//   "Removed Run-TryBot+1 by Brad Fitzpatrick <bradfitz@golang.org>\n"
+			//   "Patch Set 1: Run-TryBot+1\n\nTRY=baz"
+			msg := m.Message
+			if !strings.Contains(msg, "\n\nTRY=") ||
+				!strings.HasPrefix(msg, "Patch Set ") ||
+				!strings.Contains(firstLine(msg), "Run-TryBot+1") {
+				continue
+			}
+			pm := patchSetRx.FindStringSubmatch(msg)
+			var patchSet int
+			if pm != nil {
+				patchSet, _ = strconv.Atoi(pm[1])
+			}
+			if tm := tryCommentRx.FindStringSubmatch(msg); tm != nil && patchSet > 0 {
+				work.TryMessage = append(work.TryMessage, &apipb.TryVoteMessage{
+					Message:  tm[1],
+					AuthorId: m.Author.NumericID,
+					Version:  int32(patchSet),
+				})
+			}
+		}
+	}
+	return work
+}
+
+func firstLine(s string) string {
+	if nl := strings.Index(s, "\n"); nl < 0 {
+		return s
+	} else {
+		return s[:nl]
 	}
 }
 
@@ -160,16 +215,32 @@ func (s apiService) GoFindTryWork(ctx context.Context, req *apipb.GoFindTryWorkR
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+
+	res, err := goFindTryWork(ctx, tryBotGerrit, s.c)
+	if err != nil {
+		log.Printf("maintnerd: goFindTryWork: %v", err)
+		return nil, err
+	}
+
+	tryCache.val = res
+	tryCache.forNumChanges = sumChanges
+
+	log.Printf("maintnerd: GetTryWork: for label changes of %d, cached %d trywork items.",
+		sumChanges, len(res.Waiting))
+
+	return res, nil
+}
+
+func goFindTryWork(ctx context.Context, gerritc *gerrit.Client, maintc *maintner.Corpus) (*apipb.GoFindTryWorkResponse, error) {
 	const query = "label:Run-TryBot=1 label:TryBot-Result=0 status:open"
-	cis, err := tryBotGerrit.QueryChanges(ctx, query, gerrit.QueryChangesOpt{
-		Fields: []string{"CURRENT_REVISION", "CURRENT_COMMIT"},
+	cis, err := gerritc.QueryChanges(ctx, query, gerrit.QueryChangesOpt{
+		Fields: []string{"CURRENT_REVISION", "CURRENT_COMMIT", "MESSAGES"},
 	})
 	if err != nil {
 		return nil, err
 	}
-	tryCache.forNumChanges = sumChanges
 
-	goProj := s.c.Gerrit().Project("go.googlesource.com", "go")
+	goProj := maintc.Gerrit().Project("go.googlesource.com", "go")
 	supportedReleases, err := supportedGoReleases(goProj)
 	if err != nil {
 		return nil, err
@@ -177,16 +248,12 @@ func (s apiService) GoFindTryWork(ctx context.Context, req *apipb.GoFindTryWorkR
 
 	res := new(apipb.GoFindTryWorkResponse)
 	for _, ci := range cis {
-		cl := s.c.Gerrit().Project("go.googlesource.com", ci.Project).CL(int32(ci.ChangeNumber))
+		cl := maintc.Gerrit().Project("go.googlesource.com", ci.Project).CL(int32(ci.ChangeNumber))
 		if cl == nil {
 			log.Printf("nil Gerrit CL %v", ci.ChangeNumber)
 			continue
 		}
-		work := tryWorkItem(cl)
-		if ci.CurrentRevision != "" {
-			// In case maintner is behind.
-			work.Commit = ci.CurrentRevision
-		}
+		work := tryWorkItem(cl, ci)
 		if work.Project == "go" {
 			// Trybot on Go repo. Set the GoVersion field based on branch name.
 			if work.Branch == "master" {
@@ -218,22 +285,16 @@ func (s apiService) GoFindTryWork(ctx context.Context, req *apipb.GoFindTryWorkR
 		res.Waiting = append(res.Waiting, work)
 	}
 
-	// Sort in some stable order.
-	//
-	// TODO: better would be sorting by time the trybot was
-	// requested, or the time of the CL. But we don't return that
-	// (yet?) because the coordinator has never needed it
-	// historically. But if we do a proper scheduler (Issue
-	// 19178), perhaps it would be good data to have in the
-	// coordinator.
+	// Sort in some stable order. The coordinator's scheduler
+	// currently only uses the time the trybot run was requested,
+	// and not the commit time yet, but if two trybot runs are
+	// requested within the coordinator's poll interval, the
+	// earlier commit being first seems fair enough. Plus it's
+	// nice for interactive maintq queries to not have random
+	// orders.
 	sort.Slice(res.Waiting, func(i, j int) bool {
 		return res.Waiting[i].Commit < res.Waiting[j].Commit
 	})
-	tryCache.val = res
-
-	log.Printf("maintnerd: GetTryWork: for label changes of %d, cached %d trywork items.",
-		sumChanges, len(res.Waiting))
-
 	return res, nil
 }
 
@@ -386,4 +447,335 @@ func supportedGoReleases(goProj nonChangeRefLister) ([]*apipb.GoRelease, error) 
 		return nil, fmt.Errorf("there was a problem finding supported Go releases")
 	}
 	return rs[:2], nil
+}
+
+func (s apiService) GetDashboard(ctx context.Context, req *apipb.DashboardRequest) (*apipb.DashboardResponse, error) {
+	s.c.RLock()
+	defer s.c.RUnlock()
+
+	res := new(apipb.DashboardResponse)
+	goProj := s.c.Gerrit().Project("go.googlesource.com", "go")
+	if goProj == nil {
+		// Return a normal error here, without grpc code
+		// NotFound, because we expect to find this.
+		return nil, errors.New("go gerrit project not found")
+	}
+	if req.Repo == "" {
+		req.Repo = "go"
+	}
+	projName, err := dashRepoToGerritProj(req.Repo)
+	if err != nil {
+		return nil, err
+	}
+	proj := s.c.Gerrit().Project("go.googlesource.com", projName)
+	if proj == nil {
+		return nil, grpc.Errorf(codes.NotFound, "repo project %q not found", projName)
+	}
+
+	// Populate res.Branches.
+	const headPrefix = "refs/heads/"
+	refHash := map[string]string{} // "master" -> git commit hash
+	goProj.ForeachNonChangeRef(func(ref string, hash maintner.GitHash) error {
+		if !strings.HasPrefix(ref, headPrefix) {
+			return nil
+		}
+		branch := strings.TrimPrefix(ref, headPrefix)
+		refHash[branch] = hash.String()
+		res.Branches = append(res.Branches, branch)
+		return nil
+	})
+
+	if req.Branch == "" {
+		req.Branch = "master"
+	}
+	branch := req.Branch
+	mixBranches := branch == "mixed" // mix all branches together, by commit time
+	if !mixBranches && refHash[branch] == "" {
+		return nil, grpc.Errorf(codes.NotFound, "unknown branch %q", branch)
+	}
+
+	commitsPerPage := int(req.MaxCommits)
+	if commitsPerPage < 0 {
+		return nil, grpc.Errorf(codes.InvalidArgument, "negative max commits")
+	}
+	if commitsPerPage > 1000 {
+		commitsPerPage = 1000
+	}
+	if commitsPerPage == 0 {
+		if mixBranches {
+			commitsPerPage = 500
+		} else {
+			commitsPerPage = 30 // what build.golang.org historically used
+		}
+	}
+
+	if req.Page < 0 {
+		return nil, grpc.Errorf(codes.InvalidArgument, "invalid page")
+	}
+	if req.Page != 0 && mixBranches {
+		return nil, grpc.Errorf(codes.InvalidArgument, "branch=mixed does not support pagination")
+	}
+	skip := int(req.Page) * commitsPerPage
+	if skip >= 10000 {
+		return nil, grpc.Errorf(codes.InvalidArgument, "too far back") // arbitrary
+	}
+
+	// Find branches to merge together.
+	//
+	// By default we only have one branch (the one the user
+	// specified). But in mixed mode, as used by the coordinator
+	// when trying to find work to do, we merge all the branches
+	// together into one timeline.
+	branches := []string{branch}
+	if mixBranches {
+		branches = res.Branches
+	}
+	var oldestSkipped time.Time
+	res.Commits, res.CommitsTruncated, oldestSkipped = s.listDashCommits(proj, branches, commitsPerPage, skip)
+
+	// For non-go repos, populate the Go commits that corresponding to each commit.
+	if projName != "go" {
+		s.addGoCommits(oldestSkipped, res.Commits)
+	}
+
+	// Populate res.RepoHeads: each Gerrit repo with what its
+	// current master ref is at.
+	res.RepoHeads = s.dashRepoHeads()
+
+	// Populate res.Releases (the currently supported releases)
+	// with "master" followed by the past two release branches.
+	res.Releases = append(res.Releases, &apipb.GoRelease{
+		BranchName:   "master",
+		BranchCommit: refHash["master"],
+	})
+	releases, err := supportedGoReleases(goProj)
+	if err != nil {
+		return nil, err
+	}
+	res.Releases = append(res.Releases, releases...)
+
+	return res, nil
+}
+
+// listDashCommits merges together the commits in the provided
+// branches, sorted by commit time (newest first), skipping skip
+// items, and stopping after commitsPerPage items.
+// If len(branches) > 1, then skip must be zero.
+//
+// It returns the commits, whether more would follow on a later page,
+// and the oldest skipped commit, if any.
+func (s apiService) listDashCommits(proj *maintner.GerritProject, branches []string, commitsPerPage, skip int) (commits []*apipb.DashCommit, truncated bool, oldestSkipped time.Time) {
+	mixBranches := len(branches) > 1
+	if mixBranches && skip > 0 {
+		panic("unsupported skip in mixed mode")
+	}
+	// oldestItem is the oldest item on the page. It's used to
+	// stop iteration early on the 2nd and later branches when
+	// len(branches) > 1.
+	var oldestItem time.Time
+	for _, branch := range branches {
+		gh := proj.Ref("refs/heads/" + branch)
+		if gh == "" {
+			continue
+		}
+		skipped := 0
+		var add []*apipb.DashCommit
+		iter := s.gitLogIter(gh)
+		for len(add) < commitsPerPage && iter.HasNext() {
+			c := iter.Take()
+			if c.CommitTime.Before(oldestItem) {
+				break
+			}
+			if skipped >= skip {
+				dc := dashCommit(c)
+				dc.Branch = branch
+				add = append(add, dc)
+			} else {
+				skipped++
+				oldestSkipped = c.CommitTime
+			}
+		}
+		commits = append(commits, add...)
+		if !mixBranches {
+			truncated = iter.HasNext()
+			break
+		}
+
+		sort.Slice(commits, func(i, j int) bool {
+			return commits[i].CommitTimeSec > commits[j].CommitTimeSec
+		})
+		if len(commits) > commitsPerPage {
+			commits = commits[:commitsPerPage]
+			truncated = true
+		}
+		if len(commits) > 0 {
+			oldestItem = time.Unix(commits[len(commits)-1].CommitTimeSec, 0)
+		}
+	}
+	return commits, truncated, oldestSkipped
+}
+
+// addGoCommits populates each commit's GoCommitAtTime and
+// GoCommitLatest values. for the oldest and newest corresponding "go"
+// repo commits, respectively. That way there's at least one
+// associated Go commit (even if empty) on the dashboard when viewing
+// https://build.golang.org/?repo=golang.org/x/net.
+//
+// The provided commits must be from most recent to oldest. The
+// oldestSkipped should be the oldest commit time that's on the page
+// prior to commits, or the zero value for the first (newest) page.
+//
+// The maintner corpus must be read-locked.
+func (s apiService) addGoCommits(oldestSkipped time.Time, commits []*apipb.DashCommit) {
+	if len(commits) == 0 {
+		return
+	}
+	goProj := s.c.Gerrit().Project("go.googlesource.com", "go")
+	if goProj == nil {
+		// Shouldn't happen, except in tests with
+		// an empty maintner corpus.
+		return
+	}
+	// Find the oldest (last) commit.
+	oldestX := time.Unix(commits[len(commits)-1].CommitTimeSec, 0)
+
+	// Collect enough goCommits going back far enough such that we have one that's older
+	// than the oldest repo item on the page.
+	var goCommits []*maintner.GitCommit // newest to oldest
+	lastGoHash := func() string {
+		if len(goCommits) == 0 {
+			return ""
+		}
+		return goCommits[len(goCommits)-1].Hash.String()
+	}
+
+	goIter := s.gitLogIter(goProj.Ref("refs/heads/master"))
+	for goIter.HasNext() {
+		c := goIter.Take()
+		goCommits = append(goCommits, c)
+		if c.CommitTime.Before(oldestX) {
+			break
+		}
+	}
+
+	for i := len(commits) - 1; i >= 0; i-- { // walk from oldest to newest
+		dc := commits[i]
+		var maxGoAge time.Time
+		if i == 0 {
+			maxGoAge = oldestSkipped
+		} else {
+			maxGoAge = time.Unix(commits[i-1].CommitTimeSec, 0)
+		}
+		dc.GoCommitAtTime = lastGoHash()
+		for len(goCommits) >= 2 && goCommits[len(goCommits)-2].CommitTime.Before(maxGoAge) {
+			goCommits = goCommits[:len(goCommits)-1]
+		}
+		dc.GoCommitLatest = lastGoHash()
+	}
+}
+
+// dashRepoHeads returns the DashRepoHead for each Gerrit project on
+// the go.googlesource.com server.
+func (s apiService) dashRepoHeads() (heads []*apipb.DashRepoHead) {
+	s.c.Gerrit().ForeachProjectUnsorted(func(gp *maintner.GerritProject) error {
+		if gp.Server() != "go.googlesource.com" {
+			return nil
+		}
+		gh := gp.Ref("refs/heads/master")
+		if gh == "" {
+			return nil
+		}
+		c := gp.GitCommit(gh.String())
+		if c == nil {
+			return nil
+		}
+		heads = append(heads, &apipb.DashRepoHead{
+			GerritProject: gp.Project(),
+			Commit:        dashCommit(c),
+		})
+		return nil
+	})
+	sort.Slice(heads, func(i, j int) bool {
+		return heads[i].GerritProject < heads[j].GerritProject
+	})
+	return
+}
+
+// gitLogIter is a git log iterator.
+type gitLogIter struct {
+	corpus *maintner.Corpus
+	nexth  maintner.GitHash
+	nextc  *maintner.GitCommit // lazily looked up
+}
+
+// HasNext reports whether there's another commit to be seen.
+func (i *gitLogIter) HasNext() bool {
+	if i.nextc == nil {
+		if i.nexth == "" {
+			return false
+		}
+		i.nextc = i.corpus.GitCommit(i.nexth.String())
+	}
+	return i.nextc != nil
+}
+
+// Take returns the next commit (or nil if none remains) and advances past it.
+func (i *gitLogIter) Take() *maintner.GitCommit {
+	if !i.HasNext() {
+		return nil
+	}
+	ret := i.nextc
+	i.nextc = nil
+	if len(ret.Parents) == 0 {
+		i.nexth = ""
+	} else {
+		// TODO: care about returning the history from both
+		// sides of merge commits? Go has a linear history for
+		// the most part so punting for now. I think the old
+		// build.golang.org datastore model got confused by
+		// this too. In any case, this is like:
+		//    git log --first-parent.
+		i.nexth = ret.Parents[0].Hash
+	}
+	return ret
+}
+
+// Peek returns the next commit (or nil if none remains) without advancing past it.
+// The next call to Peek or Take will return it again.
+func (i *gitLogIter) Peek() *maintner.GitCommit {
+	if i.HasNext() {
+		// HasNext guarantees that it populates i.nextc.
+		return i.nextc
+	}
+	return nil
+}
+
+func (s apiService) gitLogIter(start maintner.GitHash) *gitLogIter {
+	return &gitLogIter{
+		corpus: s.c,
+		nexth:  start,
+	}
+}
+
+func dashCommit(c *maintner.GitCommit) *apipb.DashCommit {
+	return &apipb.DashCommit{
+		Commit:        c.Hash.String(),
+		CommitTimeSec: c.CommitTime.Unix(),
+		AuthorName:    c.Author.Name(),
+		AuthorEmail:   c.Author.Email(),
+		Title:         c.Summary(),
+	}
+}
+
+// dashRepoToGerritProj maps a DashboardRequest.repo value to
+// a go.googlesource.com Gerrit project name.
+func dashRepoToGerritProj(repo string) (proj string, err error) {
+	if repo == "go" || repo == "" {
+		return "go", nil
+	}
+	ri, ok := repos.ByImportPath[repo]
+	if !ok || ri.GoGerritProject == "" {
+		return "", grpc.Errorf(codes.NotFound, `unknown repo %q; must be empty, "go", or "golang.org/*"`, repo)
+	}
+	return ri.GoGerritProject, nil
 }

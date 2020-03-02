@@ -11,10 +11,7 @@ import (
 func gh(githubUsername string) Owner {
 	p := gophers.GetPerson("@" + githubUsername)
 	if p == nil {
-		panic(githubUsername + " not found")
-	}
-	if p.Gerrit == "" {
-		panic("person with GitHub username " + githubUsername + " must have at least one email")
+		panic("person with GitHub username " + githubUsername + " not found")
 	}
 	return Owner{GitHubUsername: githubUsername, GerritEmail: p.Gerrit}
 }
@@ -28,6 +25,7 @@ var (
 	austin       = gh("aclements")
 	bcmills      = gh("bcmills")
 	bradfitz     = gh("bradfitz")
+	carmen       = gh("Lyoness")
 	cbro         = gh("broady")
 	cherryyz     = gh("cherrymui")
 	cnoellekb    = gh("cnoellekb")
@@ -46,6 +44,7 @@ var (
 	jbd          = gh("rakyll")
 	joetsai      = gh("dsnet")
 	josharian    = gh("josharian")
+	julieqiu     = gh("julieqiu")
 	kardianos    = gh("kardianos")
 	kevinburke   = gh("kevinburke")
 	khr          = gh("randall77")
@@ -59,6 +58,8 @@ var (
 	mpvl         = gh("mpvl")
 	mvdan        = gh("mvdan")
 	mwhudson     = gh("mwhudson")
+	neelance     = gh("neelance")
+	pearring     = gh("pearring")
 	r            = gh("robpike")
 	rsc          = gh("rsc")
 	rstambler    = gh("stamblerre")
@@ -69,7 +70,7 @@ var (
 	x1ddos       = gh("x1ddos")
 )
 
-// entries is a map of <repo name>/<path> to Owner entries.
+// entries is a map of <repo name>/<path>/<domain> to Owner entries.
 // It should not be modified at runtime.
 var entries = map[string]*Entry{
 	"arch": {
@@ -109,6 +110,11 @@ var entries = map[string]*Entry{
 		Secondary: []Owner{thanm, cherryyz},
 	},
 
+	"go/misc/wasm":                 wasmOwners,
+	"go/cmd/compile/internal/wasm": wasmOwners,
+	"go/cmd/internal/obj/wasm":     wasmOwners,
+	"go/cmd/link/internal/wasm":    wasmOwners,
+
 	"go/src/archive/tar": {
 		Primary: []Owner{joetsai},
 	},
@@ -137,11 +143,11 @@ var entries = map[string]*Entry{
 	},
 	"go/src/cmd/compile/arm": {
 		Primary:   []Owner{khr},
-		Secondary: []Owner{josharian, rsc, drchase, cherryyz},
+		Secondary: []Owner{rsc, drchase, cherryyz},
 	},
 	"go/src/cmd/compile/arm64": {
 		Primary:   []Owner{khr},
-		Secondary: []Owner{josharian, rsc, drchase, cherryyz},
+		Secondary: []Owner{rsc, drchase, cherryyz},
 	},
 	"go/src/cmd/compile/mips": {
 		Primary:   []Owner{khr},
@@ -194,8 +200,7 @@ var entries = map[string]*Entry{
 		Primary: []Owner{hyangah},
 	},
 	"go/src/cmd/vet": {
-		Primary:   []Owner{adonovan},
-		Secondary: []Owner{josharian, mvdan},
+		Primary: []Owner{adonovan},
 	},
 	"go/src/compress/bzip2": {
 		Primary:   []Owner{joetsai},
@@ -335,6 +340,9 @@ var entries = map[string]*Entry{
 	"go/src/go/types": {
 		Primary:   []Owner{gri},
 		Secondary: []Owner{adonovan},
+	},
+	"go/src/hash/maphash": {
+		Primary: []Owner{khr},
 	},
 	"go/src/html/template": {
 		Primary:   []Owner{mikesamuel},
@@ -540,7 +548,7 @@ var entries = map[string]*Entry{
 	},
 	"go/src/testing": {
 		Primary:   []Owner{},
-		Secondary: []Owner{mpvl, josharian},
+		Secondary: []Owner{mpvl},
 	},
 	"go/src/testing/quick": {
 		Primary:   []Owner{},
@@ -591,6 +599,10 @@ var entries = map[string]*Entry{
 		Primary: []Owner{hyangah},
 	},
 
+	"mod": {
+		Primary: []Owner{bcmills, jayconrod},
+	},
+
 	"net": {
 		Primary:   []Owner{mikioh},
 		Secondary: []Owner{bradfitz, iant},
@@ -614,8 +626,13 @@ var entries = map[string]*Entry{
 		Primary: []Owner{mikioh, iant},
 	},
 
+	"oauth2": {
+		Primary:   []Owner{bradfitz},
+		Secondary: []Owner{jbd, cbro},
+	},
+
 	"review": {
-		Secondary: []Owner{josharian, kevinburke},
+		Secondary: []Owner{kevinburke},
 	},
 
 	"sync": {
@@ -640,12 +657,11 @@ var entries = map[string]*Entry{
 		Primary: []Owner{adonovan},
 	},
 	"tools/cmd/godoc": {
-		Primary:   []Owner{andybons},
+		Primary:   []Owner{dmitshur},
 		Secondary: []Owner{agnivade, bradfitz, gri, kevinburke},
 	},
 	"tools/cmd/goimports": {
-		Primary:   []Owner{bradfitz},
-		Secondary: []Owner{josharian},
+		Primary: []Owner{bradfitz},
 	},
 	"tools/cmd/gopls": {
 		Primary: []Owner{rstambler, iancottrell},
@@ -653,11 +669,11 @@ var entries = map[string]*Entry{
 	"tools/cmd/stringer": {
 		Secondary: []Owner{mvdan},
 	},
-	"tools/cmd/toolstash": {
-		Secondary: []Owner{josharian},
-	},
 	"tools/go/packages": {
 		Primary: []Owner{matloob},
+	},
+	"tools/godoc": {
+		Primary: []Owner{dmitshur},
 	},
 	"tools/internal/lsp": {
 		Primary: []Owner{rstambler, iancottrell},
@@ -673,4 +689,19 @@ var entries = map[string]*Entry{
 		Primary:   []Owner{dmitshur},
 		Secondary: []Owner{cnoellekb, andybons},
 	},
+
+	// These components are domains, not Go packages.
+	"pkg.go.dev": {
+		Primary: []Owner{julieqiu},
+	},
+	"learn.go.dev": {
+		Primary: []Owner{carmen, pearring},
+	},
+	"go.dev": {
+		Primary: []Owner{pearring},
+	},
+}
+
+var wasmOwners = &Entry{
+	Primary: []Owner{neelance, cherryyz},
 }

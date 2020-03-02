@@ -42,9 +42,6 @@ var (
 
 	rev       = flag.String("rev", "", "Go revision to build, alternative to -tarball")
 	tarball   = flag.String("tarball", "", "Go tree tarball to build, alternative to -rev")
-	toolsRev  = flag.String("tools", "", "Tools revision to build")
-	tourRev   = flag.String("tour", "master", "Tour revision to include")
-	netRev    = flag.String("net", "master", "Net revision to include")
 	version   = flag.String("version", "", "Version string (go1.5.2)")
 	user      = flag.String("user", username(), "coordinator username, appended to 'user-'")
 	skipTests = flag.Bool("skip_tests", false, "skip tests; run make.bash instead of all.bash (only use if you ran trybots first)")
@@ -75,9 +72,6 @@ func main() {
 	}
 	if *version == "" {
 		log.Fatal(`must specify -version flag (such as "go1.12" or "go1.13beta1")`)
-	}
-	if *toolsRev == "" && (versionIncludesGodoc(*version) || versionIncludesTour(*version)) {
-		log.Fatal("must specify -tools flag")
 	}
 
 	coordClient = coordinatorClient()
@@ -194,7 +188,7 @@ var builds = []*Build{
 		OS:      "darwin",
 		Arch:    "amd64",
 		Race:    true,
-		Builder: "darwin-amd64-10_11",
+		Builder: "darwin-amd64-10_15",
 	},
 	{
 		OS:       "linux",
@@ -235,6 +229,7 @@ func (b *Build) buildlet() (*buildlet.Client, error) {
 }
 
 func (b *Build) make() error {
+	ctx := context.TODO()
 	bc, ok := dashboard.Builders[b.Builder]
 	if !ok {
 		return fmt.Errorf("unknown builder: %v", bc)
@@ -251,7 +246,7 @@ func (b *Build) make() error {
 	}
 	defer client.Close()
 
-	work, err := client.WorkDir()
+	work, err := client.WorkDir(ctx)
 	if err != nil {
 		return err
 	}
@@ -269,57 +264,34 @@ func (b *Build) make() error {
 			b.logf("failed to open tarball %q: %v", *tarball, err)
 			return err
 		}
-		if err := client.PutTar(tarFile, goDir); err != nil {
+		if err := client.PutTar(ctx, tarFile, goDir); err != nil {
 			b.logf("failed to put tarball %q into dir %q: %v", *tarball, goDir, err)
 			return err
 		}
 		tarFile.Close()
 	} else {
 		tar := "https://go.googlesource.com/go/+archive/" + *rev + ".tar.gz"
-		if err := client.PutTarFromURL(tar, goDir); err != nil {
+		if err := client.PutTarFromURL(ctx, tar, goDir); err != nil {
 			b.logf("failed to put tarball %q into dir %q: %v", tar, goDir, err)
-			return err
-		}
-	}
-	for _, r := range []struct {
-		repo, rev string
-	}{
-		{"tools", *toolsRev},
-		{"tour", *tourRev},
-		{"net", *netRev},
-	} {
-		if b.Source {
-			continue
-		}
-		if r.repo == "tour" && !versionIncludesTour(*version) {
-			continue
-		}
-		if (r.repo == "net" || r.repo == "tools") && !versionIncludesGodoc(*version) {
-			continue
-		}
-		dir := goPath + "/src/golang.org/x/" + r.repo
-		tar := "https://go.googlesource.com/" + r.repo + "/+archive/" + r.rev + ".tar.gz"
-		if err := client.PutTarFromURL(tar, dir); err != nil {
-			b.logf("failed to put tarball %q into dir %q: %v", tar, dir, err)
 			return err
 		}
 	}
 
 	if u := bc.GoBootstrapURL(buildEnv); u != "" && !b.Source {
 		b.logf("Installing go1.4.")
-		if err := client.PutTarFromURL(u, go14); err != nil {
+		if err := client.PutTarFromURL(ctx, u, go14); err != nil {
 			return err
 		}
 	}
 
 	// Write out version file.
 	b.logf("Writing VERSION file.")
-	if err := client.Put(strings.NewReader(*version), "go/VERSION", 0644); err != nil {
+	if err := client.Put(ctx, strings.NewReader(*version), "go/VERSION", 0644); err != nil {
 		return err
 	}
 
 	b.logf("Cleaning goroot (pre-build).")
-	if err := client.RemoveAll(addPrefix(goDir, preBuildCleanFiles)...); err != nil {
+	if err := client.RemoveAll(ctx, addPrefix(goDir, preBuildCleanFiles)...); err != nil {
 		return err
 	}
 
@@ -327,18 +299,18 @@ func (b *Build) make() error {
 		b.logf("Skipping build.")
 
 		// Remove unwanted top-level directories and verify only "go" remains:
-		if err := client.RemoveAll("tmp", "gocache"); err != nil {
+		if err := client.RemoveAll(ctx, "tmp", "gocache"); err != nil {
 			return err
 		}
-		if err := b.checkTopLevelDirs(client); err != nil {
+		if err := b.checkTopLevelDirs(ctx, client); err != nil {
 			return fmt.Errorf("verifying no unwanted top-level directories: %v", err)
 		}
-		if err := b.checkPerm(client); err != nil {
+		if err := b.checkPerm(ctx, client); err != nil {
 			return fmt.Errorf("verifying file permissions: %v", err)
 		}
 
 		finalFilename := *version + "." + b.String() + ".tar.gz"
-		return b.fetchTarball(client, finalFilename)
+		return b.fetchTarball(ctx, client, finalFilename)
 	}
 
 	// Set up build environment.
@@ -359,6 +331,12 @@ func (b *Build) make() error {
 		env = append(env, fmt.Sprintf("CGO_LDFLAGS=-march=armv%d", b.Goarm))
 	}
 
+	// Issues #36025 #35459
+	if b.OS == "darwin" && b.Arch == "amd64" {
+		minMacVersion := minSupportedMacOSVersion(*version)
+		env = append(env, fmt.Sprintf("CGO_CFLAGS=-mmacosx-version-min=%s", minMacVersion))
+	}
+
 	// Execute build (make.bash only first).
 	b.logf("Building (make.bash only).")
 	out := new(bytes.Buffer)
@@ -366,7 +344,7 @@ func (b *Build) make() error {
 	if *watch && *target != "" {
 		execOut = io.MultiWriter(out, os.Stdout)
 	}
-	remoteErr, err := client.Exec(filepath.Join(goDir, bc.MakeScript()), buildlet.ExecOpts{
+	remoteErr, err := client.Exec(context.Background(), filepath.Join(goDir, bc.MakeScript()), buildlet.ExecOpts{
 		Output:   execOut,
 		ExtraEnv: env,
 		Args:     bc.MakeScriptArgs(),
@@ -396,7 +374,7 @@ func (b *Build) make() error {
 		if len(args) > 0 && args[0] == "run" && hostArch != "" {
 			cmdEnv = setGOARCH(cmdEnv, hostArch)
 		}
-		remoteErr, err := client.Exec(goCmd, buildlet.ExecOpts{
+		remoteErr, err := client.Exec(context.Background(), goCmd, buildlet.ExecOpts{
 			Output:   execOut,
 			Dir:      ".", // root of buildlet work directory
 			Args:     args,
@@ -419,20 +397,6 @@ func (b *Build) make() error {
 		}
 	}
 
-	var toolPaths []string
-	if versionIncludesGodoc(*version) {
-		toolPaths = append(toolPaths, "golang.org/x/tools/cmd/godoc")
-	}
-	if versionIncludesTour(*version) {
-		toolPaths = append(toolPaths, "golang.org/x/tour")
-	}
-	if len(toolPaths) > 0 {
-		b.logf("Building %v.", strings.Join(toolPaths, ", "))
-		if err := runGo(append([]string{"install"}, toolPaths...)...); err != nil {
-			return err
-		}
-	}
-
 	// postBuildCleanFiles are the list of files to remove in the go/ directory
 	// after things have been built.
 	postBuildCleanFiles := []string{
@@ -443,7 +407,7 @@ func (b *Build) make() error {
 	// Remove race detector *.syso files for other GOOS/GOARCHes (except for the source release).
 	if !b.Source {
 		okayRace := fmt.Sprintf("race_%s_%s.syso", b.OS, b.Arch)
-		err := client.ListDir(".", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
+		err := client.ListDir(ctx, ".", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
 			name := strings.TrimPrefix(ent.Name(), "go/")
 			if strings.HasPrefix(name, "src/runtime/race/race_") &&
 				strings.HasSuffix(name, ".syso") &&
@@ -457,12 +421,12 @@ func (b *Build) make() error {
 	}
 
 	b.logf("Cleaning goroot (post-build).")
-	if err := client.RemoveAll(addPrefix(goDir, postBuildCleanFiles)...); err != nil {
+	if err := client.RemoveAll(ctx, addPrefix(goDir, postBuildCleanFiles)...); err != nil {
 		return err
 	}
 	// Users don't need the api checker binary pre-built. It's
 	// used by tests, but all.bash builds it first.
-	if err := client.RemoveAll(b.toolDir() + "/api"); err != nil {
+	if err := client.RemoveAll(ctx, b.toolDir()+"/api"); err != nil {
 		return err
 	}
 	// Remove go/pkg/${GOOS}_${GOARCH}/cmd. This saves a bunch of
@@ -473,7 +437,7 @@ func (b *Build) make() error {
 	//
 	// Also remove go/pkg/${GOOS}_${GOARCH}_{dynlink,shared,testcshared_shared}
 	// per Issue 20038.
-	if err := client.RemoveAll(
+	if err := client.RemoveAll(ctx,
 		b.pkgDir()+"/cmd",
 		b.pkgDir()+"_dynlink",
 		b.pkgDir()+"_shared",
@@ -483,13 +447,13 @@ func (b *Build) make() error {
 	}
 
 	b.logf("Pushing and running releaselet.")
-	err = client.Put(strings.NewReader(releaselet), "releaselet.go", 0666)
+	err = client.Put(ctx, strings.NewReader(releaselet), "releaselet.go", 0666)
 	if err != nil {
 		return err
 	}
 	if err := runGo("run", "releaselet.go"); err != nil {
 		log.Printf("releaselet failed: %v", err)
-		client.ListDir(".", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
+		client.ListDir(ctx, ".", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
 			log.Printf("remote: %v", ent)
 		})
 		return err
@@ -518,18 +482,7 @@ func (b *Build) make() error {
 		return filepath.Join(stagingDir, *version+"."+b.String()+ext+".untested")
 	}
 
-	switch b.OS {
-	case "darwin":
-		untested := stagingFile(".pkg")
-		if err := b.fetchFile(client, untested, "pkg"); err != nil {
-			return err
-		}
-		releases = append(releases, releaseFile{
-			Untested: untested,
-			Final:    *version + "." + b.String() + ".pkg",
-		})
-		cleanFiles = append(cleanFiles, "pkg")
-	case "windows":
+	if b.OS == "windows" {
 		untested := stagingFile(".msi")
 		if err := b.fetchFile(client, untested, "msi"); err != nil {
 			return err
@@ -544,23 +497,23 @@ func (b *Build) make() error {
 	// Need to delete everything except the final "go" directory,
 	// as we make the tarball relative to workdir.
 	b.logf("Cleaning workdir.")
-	if err := client.RemoveAll(cleanFiles...); err != nil {
+	if err := client.RemoveAll(ctx, cleanFiles...); err != nil {
 		return err
 	}
 
 	// And verify there's no other top-level stuff besides the "go" directory:
-	if err := b.checkTopLevelDirs(client); err != nil {
+	if err := b.checkTopLevelDirs(ctx, client); err != nil {
 		return fmt.Errorf("verifying no unwanted top-level directories: %v", err)
 	}
 
-	if err := b.checkPerm(client); err != nil {
+	if err := b.checkPerm(ctx, client); err != nil {
 		return fmt.Errorf("verifying file permissions: %v", err)
 	}
 
 	switch b.OS {
 	default:
 		untested := stagingFile(".tar.gz")
-		if err := b.fetchTarball(client, untested); err != nil {
+		if err := b.fetchTarball(ctx, client, untested); err != nil {
 			return fmt.Errorf("fetching and writing tarball: %v", err)
 		}
 		releases = append(releases, releaseFile{
@@ -584,7 +537,7 @@ func (b *Build) make() error {
 	} else {
 		if u := bc.GoBootstrapURL(buildEnv); u != "" {
 			b.logf("Installing go1.4 (second time, for all.bash).")
-			if err := client.PutTarFromURL(u, go14); err != nil {
+			if err := client.PutTarFromURL(ctx, u, go14); err != nil {
 				return err
 			}
 		}
@@ -595,7 +548,7 @@ func (b *Build) make() error {
 		if *watch && *target != "" {
 			execOut = io.MultiWriter(out, os.Stdout)
 		}
-		remoteErr, err := client.Exec(filepath.Join(goDir, bc.AllScript()), buildlet.ExecOpts{
+		remoteErr, err := client.Exec(ctx, filepath.Join(goDir, bc.AllScript()), buildlet.ExecOpts{
 			Output:   execOut,
 			ExtraEnv: env,
 			Args:     bc.AllScriptArgs(),
@@ -621,9 +574,9 @@ func (b *Build) make() error {
 
 // checkTopLevelDirs checks that all files under client's "."
 // ($WORKDIR) are are under "go/".
-func (b *Build) checkTopLevelDirs(client *buildlet.Client) error {
+func (b *Build) checkTopLevelDirs(ctx context.Context, client *buildlet.Client) error {
 	var badFileErr error // non-nil once an unexpected file/dir is found
-	if err := client.ListDir(".", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
+	if err := client.ListDir(ctx, ".", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
 		name := ent.Name()
 		if !(strings.HasPrefix(name, "go/") || strings.HasPrefix(name, `go\`)) {
 			b.logf("unexpected file: %q", name)
@@ -639,7 +592,7 @@ func (b *Build) checkTopLevelDirs(client *buildlet.Client) error {
 
 // checkPerm checks that files in client's $WORKDIR/go directory
 // have expected permissions.
-func (b *Build) checkPerm(client *buildlet.Client) error {
+func (b *Build) checkPerm(ctx context.Context, client *buildlet.Client) error {
 	var badPermErr error // non-nil once an unexpected perm is found
 	checkPerm := func(ent buildlet.DirEntry, allowed ...string) {
 		for _, p := range allowed {
@@ -652,7 +605,7 @@ func (b *Build) checkPerm(client *buildlet.Client) error {
 			badPermErr = fmt.Errorf("unexpected file %q perm %q found", ent.Name(), ent.Perm())
 		}
 	}
-	if err := client.ListDir("go", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
+	if err := client.ListDir(ctx, "go", buildlet.ListDirOpts{Recursive: true}, func(ent buildlet.DirEntry) {
 		switch b.OS {
 		default:
 			checkPerm(ent, "drwxr-xr-x", "-rw-r--r--", "-rwxr-xr-x")
@@ -663,7 +616,7 @@ func (b *Build) checkPerm(client *buildlet.Client) error {
 		return err
 	}
 	if !b.Source {
-		if err := client.ListDir("go/bin", buildlet.ListDirOpts{}, func(ent buildlet.DirEntry) {
+		if err := client.ListDir(ctx, "go/bin", buildlet.ListDirOpts{}, func(ent buildlet.DirEntry) {
 			switch b.OS {
 			default:
 				checkPerm(ent, "-rwxr-xr-x")
@@ -677,9 +630,9 @@ func (b *Build) checkPerm(client *buildlet.Client) error {
 	return badPermErr
 }
 
-func (b *Build) fetchTarball(client *buildlet.Client, dest string) error {
+func (b *Build) fetchTarball(ctx context.Context, client *buildlet.Client, dest string) error {
 	b.logf("Downloading tarball.")
-	tgz, err := client.GetTar(context.Background(), ".")
+	tgz, err := client.GetTar(ctx, ".")
 	if err != nil {
 		return err
 	}
@@ -814,7 +767,7 @@ func (b *Build) checkRelocations(client *buildlet.Client) error {
 	}
 	var out bytes.Buffer
 	file := fmt.Sprintf("go/pkg/linux_%s/runtime/cgo.a", b.Arch)
-	remoteErr, err := client.Exec("readelf", buildlet.ExecOpts{
+	remoteErr, err := client.Exec(context.Background(), "readelf", buildlet.ExecOpts{
 		Output:      &out,
 		Args:        []string{"-r", "--wide", file},
 		SystemLevel: true, // look for readelf in system's PATH
@@ -931,22 +884,19 @@ func setGOARCH(env []string, goarch string) []string {
 	return append(env, wantKV)
 }
 
-// versionIncludesTour reports whether the provided Go version (of the
-// form "go1.N" or "go1.N.M" includes the Go tour binary.
-func versionIncludesTour(goVer string) bool {
-	// We don't do releases of Go 1.9 and earlier, so this only
-	// needs to recognize the two current past releases. From Go
-	// 1.12 and on, we won't ship the tour binary (see CL 131156).
-	return strings.HasPrefix(goVer, "go1.10.") ||
-		strings.HasPrefix(goVer, "go1.11.")
-}
+// minSupportedMacOSVersion provides the minimum supported macOS
+// version (of the form N.M) for supported Go versions.
+func minSupportedMacOSVersion(goVer string) string {
+	// TODO(amedee): Use a version package to compare versions of Go.
 
-// versionIncludesGodoc reports whether the provided Go version (of the
-// form "go1.N" or "go1.N.M" includes the godoc binary.
-func versionIncludesGodoc(goVer string) bool {
-	// We don't do releases of Go 1.10 and earlier, so this only
-	// needs to recognize the two current past releases. From Go
-	// 1.13 and on, we won't ship the godoc binary (see Issue 30029).
-	return strings.HasPrefix(goVer, "go1.11.") ||
-		strings.HasPrefix(goVer, "go1.12.")
+	// The minimum supported version of macOS with each version of go:
+	// go1.13 - macOS 10.11
+	// go1.14 - macOS 10.11
+	// go1.15 - macOS 10.12
+	minMacVersion := "10.12"
+	if strings.HasPrefix(goVer, "go1.13") || strings.HasPrefix(goVer, "go1.14") {
+		minMacVersion = "10.11"
+		return minMacVersion
+	}
+	return minMacVersion
 }

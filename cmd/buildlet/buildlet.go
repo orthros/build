@@ -14,7 +14,6 @@ package main // import "golang.org/x/build/cmd/buildlet"
 
 import (
 	"archive/tar"
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -43,7 +42,6 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"golang.org/x/build/buildlet"
-	"golang.org/x/build/internal/httpdl"
 	"golang.org/x/build/pargzip"
 )
 
@@ -52,7 +50,6 @@ var (
 	rebootOnHalt = flag.Bool("reboot", false, "reboot system in /halt handler.")
 	workDir      = flag.String("workdir", "", "Temporary directory to use. The contents of this directory may be deleted at any time. If empty, TempDir is used to create one.")
 	listenAddr   = flag.String("listen", "AUTO", "address to listen on. Unused in reverse mode. Warning: this service is inherently insecure and offers no protection of its own. Do not expose this port to the world.")
-	reverse      = flag.String("reverse", "", "[deprecated; use --reverse-type instead] if non-empty, go into reverse mode where the buildlet dials the coordinator instead of listening for connections. The value is a comma-separated list of modes, e.g. 'darwin-arm,darwin-amd64-race'")
 	reverseType  = flag.String("reverse-type", "", "if non-empty, go into reverse mode where the buildlet dials the coordinator instead of listening for connections. The value is the dashboard/builders.go Hosts map key, naming a HostConfig. This buildlet will receive work for any BuildConfig specifying this named HostConfig.")
 	coordinator  = flag.String("coordinator", "localhost:8119", "address of coordinator, in production use farmer.golang.org. Only used in reverse mode.")
 	hostname     = flag.String("hostname", "", "hostname to advertise to coordinator for reverse mode; default is actual hostname")
@@ -77,7 +74,8 @@ var (
 //   22: TrimSpace the reverse buildlet's gobuildkey contents
 //   23: revdial v2
 //   24: removeAllIncludingReadonly
-const buildletVersion = 24
+//   25: use removeAllIncludingReadonly for all work area cleanup
+const buildletVersion = 25
 
 func defaultListenAddr() string {
 	if runtime.GOOS == "darwin" {
@@ -144,13 +142,6 @@ func main() {
 		startAndroidEmulator()
 	}
 
-	if *reverse == "solaris-amd64-smartosbuildlet" {
-		// These machines were setup without GO_BUILDER_ENV
-		// set in their base image, so do init work here after
-		// flag parsing instead of at top.
-		*rebootOnHalt = true
-	}
-
 	// Optimize emphemeral filesystems. Prefer speed over safety,
 	// since these VMs only last for the duration of one build.
 	switch runtime.GOOS {
@@ -165,10 +156,7 @@ func main() {
 		log.Printf("set OS rlimits.")
 	}
 
-	if *reverse != "" && *reverseType != "" {
-		log.Fatalf("can't specify both --reverse and --reverse-type")
-	}
-	isReverse := *reverse != "" || *reverseType != ""
+	isReverse := *reverseType != ""
 
 	if *listenAddr == "AUTO" && !isReverse {
 		v := defaultListenAddr()
@@ -200,12 +188,7 @@ func main() {
 				wdName += "-" + *reverseType
 			}
 			dir := filepath.Join(os.TempDir(), wdName)
-			if err := os.RemoveAll(dir); err != nil { // should be no-op
-				log.Fatal(err)
-			}
-			if err := os.Mkdir(dir, 0755); err != nil {
-				log.Fatal(err)
-			}
+			removeAllAndMkdir(dir)
 			*workDir = dir
 		}
 	}
@@ -268,60 +251,6 @@ func initGorootBootstrap() {
 
 	// Default if not otherwise configured in dashboard/builders.go:
 	os.Setenv("GOROOT_BOOTSTRAP", filepath.Join(*workDir, "go1.4"))
-
-	if runtime.GOOS == "solaris" && runtime.GOARCH == "amd64" {
-		gbenv := os.Getenv("GO_BUILDER_ENV")
-		if strings.Contains(gbenv, "oracle") {
-			// Oracle Solaris; not OpenSolaris-based or
-			// Illumos-based.  Do nothing.
-			return
-		}
-
-		// Assume this is an OpenSolaris-based machine or a
-		// SmartOS/Illumos machine before GOOS=="illumos" split.  For
-		// these machines, the old Joyent builders need to get the
-		// bootstrap and some config fixed.
-		os.Setenv("PATH", os.Getenv("PATH")+":/opt/local/bin")
-		downloadBootstrapGoroot("/root/go-solaris-amd64-bootstrap", "https://storage.googleapis.com/go-builder-data/gobootstrap-solaris-amd64.tar.gz")
-	}
-	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64" {
-		downloadBootstrapGoroot("/usr/local/go-bootstrap", "https://storage.googleapis.com/go-builder-data/gobootstrap-linux-ppc64.tar.gz")
-	}
-}
-
-func downloadBootstrapGoroot(destDir, url string) {
-	tarPath := destDir + ".tar.gz"
-	origInfo, err := os.Stat(tarPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Fatalf("Checking for tar existence: %v", err)
-	}
-	if err := httpdl.Download(tarPath, url); err != nil {
-		log.Fatalf("Downloading %s to %s: %v", url, tarPath, err)
-	}
-	newInfo, err := os.Stat(tarPath)
-	if err != nil {
-		log.Fatalf("Stat after download: %v", err)
-	}
-	if os.SameFile(origInfo, newInfo) {
-		// The file on disk was unmodified, so we probably untarred it already.
-		return
-	}
-	if err := os.RemoveAll(destDir); err != nil {
-		log.Fatal(err)
-	}
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		log.Fatal(err)
-	}
-	f, err := os.Open(tarPath)
-	if err != nil {
-		log.Fatalf("Opening after download: %v", err)
-	}
-	defer f.Close()
-	if err := untar(f, destDir); err != nil {
-		os.Remove(tarPath)
-		os.RemoveAll(destDir)
-		log.Fatalf("Untarring %s: %v", url, err)
-	}
 }
 
 func listenForCoordinator() {
@@ -379,7 +308,7 @@ func listenForCoordinator() {
 // registerSignal if non-nil registers shutdown signals with the provided chan.
 var registerSignal func(chan<- os.Signal)
 
-var inKube, _ = strconv.ParseBool(os.Getenv("IN_KUBERNETES"))
+var inKube = os.Getenv("KUBERNETES_SERVICE_HOST") != ""
 
 // metadataValue returns the GCE metadata instance value for the given key.
 // If the metadata is not defined, the returned string is empty.
@@ -1231,7 +1160,7 @@ func doHalt() {
 			err = errors.New("not respecting -halt flag on macOS in unknown environment")
 		}
 	default:
-		err = errors.New("No system-specific halt command run; will just end buildlet process.")
+		err = errors.New("no system-specific halt command run; will just end buildlet process")
 	}
 	log.Printf("Shutdown: %v", err)
 	log.Printf("Ending buildlet process post-halt")
@@ -1408,14 +1337,27 @@ func handleConnectSSH(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sshConn, err := net.Dial("tcp", "localhost:"+sshPort())
-	if err != nil {
-		sshServerOnce.Do(startSSHServer)
+	sshServerOnce.Do(startSSHServer)
+
+	var sshConn net.Conn
+	var err error
+
+	// In theory we shouldn't need retries here at all, but the
+	// startSSHServerLinux's use of sshd -D is kinda sketchy and
+	// restarts the process whenever we connect to it, so in case
+	// it's just down between restarts, try a few times. 5 tries
+	// and 5 seconds seems plenty.
+	const maxTries = 5
+	for try := 1; try <= maxTries; try++ {
 		sshConn, err = net.Dial("tcp", "localhost:"+sshPort())
-		if err != nil {
+		if err == nil {
+			break
+		}
+		if try == maxTries {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		time.Sleep(time.Second)
 	}
 	defer sshConn.Close()
 	hj, ok := w.(http.Hijacker)
@@ -1521,13 +1463,27 @@ func startSSHServerLinux() {
 		}
 	}
 
-	cmd := exec.Command("/usr/sbin/sshd", "-D", "-p", sshPort())
-	err := cmd.Start()
-	if err != nil {
-		log.Printf("starting sshd: %v", err)
-		return
-	}
-	log.Printf("sshd started.")
+	go func() {
+		for {
+			// TODO: using sshd -D isn't great as it only
+			// handles a single connection and exits.
+			// Maybe run in sshd -i (inetd) mode instead,
+			// and hook that up to the buildlet directly?
+			t0 := time.Now()
+			cmd := exec.Command("/usr/sbin/sshd", "-D", "-p", sshPort(), "-d", "-d")
+			cmd.Stderr = os.Stderr
+			err := cmd.Start()
+			if err != nil {
+				log.Printf("starting sshd: %v", err)
+				return
+			}
+			log.Printf("sshd started.")
+			log.Printf("sshd exited: %v; restarting", cmd.Wait())
+			if d := time.Since(t0); d < time.Second {
+				time.Sleep(time.Second - d)
+			}
+		}
+	}()
 	waitLocalSSH()
 }
 
@@ -1640,15 +1596,6 @@ func (pw *plan9LogWriter) Write(p []byte) (n int, err error) {
 	return pw.w.Write(pw.buf[:n+1])
 }
 
-func requireTrailerSupport() {
-	// Depend on a symbol that was added after HTTP Trailer support was
-	// implemented (4b96409 Dec 29 2014) so that this function will fail
-	// to compile without Trailer support.
-	// bufio.Reader.Discard was added by ee2ecc4 Jan 7 2015.
-	var r bufio.Reader
-	_ = r.Discard
-}
-
 var killProcessTree = killProcessTreeUnix
 
 func killProcessTreeUnix(p *os.Process) error {
@@ -1675,11 +1622,7 @@ func configureMacStadium() {
 		log.Fatalf("unsupported sw_vers version %q", version)
 	}
 	major, minor := m[1], m[2] // "10", "12"
-	if m, _ := strconv.Atoi(minor); m >= 13 {
-		*reverseType = "host-darwin-10_" + minor
-	} else {
-		*reverse = "darwin-amd64-" + major + "_" + minor
-	}
+	*reverseType = fmt.Sprintf("host-darwin-%s_%s", major, minor)
 	*coordinator = "farmer.golang.org:443"
 
 	// guestName is set by cmd/makemac to something like
@@ -1830,7 +1773,7 @@ func appendSSHAuthorizedKey(sshUser, authKey string) error {
 	}
 	if runtime.GOOS == "windows" {
 		if res, err := exec.Command("icacls.exe", authFile, "/grant", `NT SERVICE\sshd:(R)`).CombinedOutput(); err != nil {
-			return fmt.Errorf("setting permissions on authorized_keys with: %v\n%s.", err, res)
+			return fmt.Errorf("setting permissions on authorized_keys with: %v\n%s", err, res)
 		}
 	}
 	return nil
@@ -1853,10 +1796,10 @@ func initBaseUnixEnv() {
 	}
 }
 
-// removeAllAndMkdir calls os.RemoveAll and then os.Mkdir on the given
+// removeAllAndMkdir calls removeAllIncludingReadonly and then os.Mkdir on the given
 // dir, failing the process if either step fails.
 func removeAllAndMkdir(dir string) {
-	if err := os.RemoveAll(dir); err != nil {
+	if err := removeAllIncludingReadonly(dir); err != nil {
 		log.Fatal(err)
 	}
 	if err := os.Mkdir(dir, 0755); err != nil {
@@ -1870,8 +1813,7 @@ func removeAllAndMkdir(dir string) {
 func removeAllIncludingReadonly(dir string) error {
 	err := os.RemoveAll(dir)
 	if err == nil || !os.IsPermission(err) ||
-		runtime.GOOS == "windows" || // different filesystem permission model; also our windows builders our emphermal single-use VMs anyway
-		runtime.GOOS == "plan9" { // untested, different enough to conservatively skip code below
+		runtime.GOOS == "windows" { // different filesystem permission model; also our windows builders are ephemeral single-use VMs anyway
 		return err
 	}
 	// Make a best effort (ignoring errors) attempt to make all

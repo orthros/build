@@ -32,6 +32,7 @@ import (
 	"golang.org/x/build/devapp/owners"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/build/internal/foreach"
+	"golang.org/x/build/internal/gophers"
 	"golang.org/x/build/maintner"
 	"golang.org/x/build/maintner/godata"
 	"golang.org/x/build/maintner/maintnerd/apipb"
@@ -207,6 +208,7 @@ func main() {
 		ghc:    ghc,
 		gerrit: gerrit,
 		mc:     mc,
+		is:     ghc.Issues,
 		deletedChanges: map[gerritChange]bool{
 			{"crypto", 35958}:  true,
 			{"scratch", 71730}: true,
@@ -264,6 +266,7 @@ type gopherbot struct {
 	mc     apipb.MaintnerServiceClient
 	corpus *maintner.Corpus
 	gorepo *maintner.GitHubRepo
+	is     issuesService
 
 	knownContributors map[string]bool
 
@@ -292,6 +295,7 @@ var tasks = []struct {
 	{"label mobile issues", (*gopherbot).labelMobileIssues},
 	{"label documentation issues", (*gopherbot).labelDocumentationIssues},
 	{"label tools issues", (*gopherbot).labelToolsIssues},
+	{"label go.dev issues", (*gopherbot).labelGoDevIssues},
 	{"handle gopls issues", (*gopherbot).handleGoplsIssues},
 	{"close stale WaitingForInfo", (*gopherbot).closeStaleWaitingForInfo},
 	{"cl2issue", (*gopherbot).cl2issue},
@@ -339,6 +343,13 @@ func (b *gopherbot) doTasks(ctx context.Context) []error {
 	return errs
 }
 
+// issuesService represents portions of github.IssuesService that we want to override in tests.
+type issuesService interface {
+	ListLabelsByIssue(ctx context.Context, owner string, repo string, number int, opt *github.ListOptions) ([]*github.Label, *github.Response, error)
+	AddLabelsToIssue(ctx context.Context, owner string, repo string, number int, labels []string) ([]*github.Label, *github.Response, error)
+	RemoveLabelForIssue(ctx context.Context, owner string, repo string, number int, label string) (*github.Response, error)
+}
+
 func (b *gopherbot) addLabel(ctx context.Context, gi *maintner.GitHubIssue, label string) error {
 	return b.addLabels(ctx, gi, []string{label})
 }
@@ -358,13 +369,7 @@ func (b *gopherbot) addLabels(ctx context.Context, gi *maintner.GitHubIssue, lab
 		return nil
 	}
 
-	return addLabelsToIssue(ctx, b.ghc.Issues, int(gi.Number), toAdd)
-}
-
-// addLabelsToIssue adds labels to the issue in golang/go with the given issueNum.
-// TODO: Proper stubs via interfaces.
-var addLabelsToIssue = func(ctx context.Context, issues *github.IssuesService, issueNum int, labels []string) error {
-	_, _, err := issues.AddLabelsToIssue(ctx, "golang", "go", issueNum, labels)
+	_, _, err := b.is.AddLabelsToIssue(ctx, "golang", "go", int(gi.Number), toAdd)
 	return err
 }
 
@@ -388,7 +393,7 @@ func (b *gopherbot) removeLabels(ctx context.Context, gi *maintner.GitHubIssue, 
 		return nil
 	}
 
-	ghLabels, err := labelsForIssue(ctx, b.ghc.Issues, int(gi.Number))
+	ghLabels, err := labelsForIssue(ctx, b.is, int(gi.Number))
 	if err != nil {
 		return err
 	}
@@ -399,7 +404,7 @@ func (b *gopherbot) removeLabels(ctx context.Context, gi *maintner.GitHubIssue, 
 
 	for _, l := range ghLabels {
 		if toRemove[l] {
-			if err := removeLabelFromIssue(ctx, b.ghc.Issues, int(gi.Number), l); err != nil {
+			if err := removeLabelFromIssue(ctx, b.is, int(gi.Number), l); err != nil {
 				log.Printf("Could not remove label %q from issue %d: %v", l, gi.Number, err)
 				continue
 			}
@@ -409,8 +414,7 @@ func (b *gopherbot) removeLabels(ctx context.Context, gi *maintner.GitHubIssue, 
 }
 
 // labelsForIssue returns all labels for the given issue in the golang/go repo.
-// TODO: Proper stubs via interfaces.
-var labelsForIssue = func(ctx context.Context, issues *github.IssuesService, issueNum int) ([]string, error) {
+func labelsForIssue(ctx context.Context, issues issuesService, issueNum int) ([]string, error) {
 	ghLabels, _, err := issues.ListLabelsByIssue(ctx, "golang", "go", issueNum, &github.ListOptions{PerPage: 100})
 	if err != nil {
 		return nil, fmt.Errorf("could not list labels for golang/go#%d: %v", issueNum, err)
@@ -424,8 +428,7 @@ var labelsForIssue = func(ctx context.Context, issues *github.IssuesService, iss
 
 // removeLabelForIssue removes the given label from golang/go with the given issueNum.
 // If the issue did not have the label already (or the label didn't exist), return nil.
-// TODO: Proper stubs via interfaces.
-var removeLabelFromIssue = func(ctx context.Context, issues *github.IssuesService, issueNum int, label string) error {
+func removeLabelFromIssue(ctx context.Context, issues issuesService, issueNum int, label string) error {
 	_, err := issues.RemoveLabelForIssue(ctx, "golang", "go", issueNum, label)
 	if ge, ok := err.(*github.ErrorResponse); ok && ge.Response != nil && ge.Response.StatusCode == http.StatusNotFound {
 		return nil
@@ -854,6 +857,9 @@ func (b *gopherbot) setMiscMilestones(ctx context.Context) error {
 		if strings.HasPrefix(gi.Title, "x/vgo") {
 			return b.setMilestone(ctx, gi, vgo)
 		}
+		if strings.HasPrefix(gi.Title, "go.dev:") {
+			return b.setMilestone(ctx, gi, unreleased)
+		}
 		return nil
 	})
 }
@@ -894,6 +900,15 @@ func (b *gopherbot) labelToolsIssues(ctx context.Context) error {
 	})
 }
 
+func (b *gopherbot) labelGoDevIssues(ctx context.Context) error {
+	return b.gorepo.ForeachIssue(func(gi *maintner.GitHubIssue) error {
+		if gi.Closed || gi.PullRequest || !strings.HasPrefix(gi.Title, "go.dev:") || gi.HasLabel("go.dev") || gi.HasEvent("unlabeled") {
+			return nil
+		}
+		return b.addLabel(ctx, gi, "go.dev")
+	})
+}
+
 // handleGoplsIssues labels and asks for additional information on gopls issues.
 //
 // This is necessary because gopls issues often require additional information to diagnose,
@@ -906,7 +921,11 @@ func (b *gopherbot) handleGoplsIssues(ctx context.Context) error {
 		if err := b.addLabel(ctx, gi, "gopls"); err != nil {
 			return err
 		}
-		// Request more information from the user.
+		// Check if the person filing the issue is known through Gerrit.
+		// If not, add a comment directing them to the troubleshooting guide.
+		if person := gophers.GetPerson("@" + gi.User.Login); person != nil {
+			return nil
+		}
 		const comment = "Thank you for filing a gopls issue! Please take a look at the " +
 			"[Troubleshooting guide](https://github.com/golang/tools/blob/master/gopls/doc/troubleshooting.md#troubleshooting), " +
 			"and make sure that you have provided all of the relevant information here."
@@ -2081,6 +2100,12 @@ func isDocumentationTitle(t string) bool {
 }
 
 func isGoplsTitle(t string) bool {
+	// If the prefix doesn't contain "gopls" or "lsp",
+	// then it may not be a gopls issue.
+	i := strings.Index(t, ":")
+	if i > -1 {
+		t = t[:i]
+	}
 	return strings.Contains(t, "gopls") || strings.Contains(t, "lsp")
 }
 

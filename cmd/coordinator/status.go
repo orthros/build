@@ -141,8 +141,7 @@ func addHealthCheckers(ctx context.Context) {
 	addHealthChecker(newPacketHealthChecker())
 	addHealthChecker(newOSUPPC64Checker())
 	addHealthChecker(newOSUPPC64leChecker())
-	addHealthChecker(newJoyentSolarisChecker())
-	addHealthChecker(newJoyentIllumosChecker())
+	addHealthChecker(newOSUPPC64lePower9Checker())
 	addHealthChecker(newBasepinChecker())
 	addHealthChecker(newGitMirrorChecker())
 	addHealthChecker(newTipGolangOrgChecker(ctx))
@@ -371,24 +370,6 @@ func fetchMakeMacStatus() (errs, warns []string) {
 	return resj.Errors, resj.Warnings
 }
 
-func newJoyentSolarisChecker() *healthChecker {
-	return &healthChecker{
-		ID:     "joyent-solaris",
-		Title:  "Joyent solaris/amd64 machines",
-		DocURL: "https://github.com/golang/build/tree/master/env/solaris-amd64/joyent",
-		Check:  hostTypeChecker("host-solaris-amd64"),
-	}
-}
-
-func newJoyentIllumosChecker() *healthChecker {
-	return &healthChecker{
-		ID:     "joyent-illumos",
-		Title:  "Joyent illumos/amd64 machines",
-		DocURL: "https://github.com/golang/build/tree/master/env/illumos-amd64-joyent",
-		Check:  hostTypeChecker("host-illumos-amd64-joyent"),
-	}
-}
-
 func hostTypeChecker(hostType string) func(cw *checkWriter) {
 	want := expectedHosts(hostType)
 	return func(cw *checkWriter) {
@@ -446,7 +427,7 @@ func newPacketHealthChecker() *healthChecker {
 func newOSUPPC64Checker() *healthChecker {
 	var hosts []string
 	for i := 1; i <= expectedHosts("host-linux-ppc64-osu"); i++ {
-		name := fmt.Sprintf("go-be-%v", i)
+		name := fmt.Sprintf("host-linux-ppc64-osu:ppc64_%02d", i)
 		hosts = append(hosts, name)
 	}
 	return &healthChecker{
@@ -460,12 +441,26 @@ func newOSUPPC64Checker() *healthChecker {
 func newOSUPPC64leChecker() *healthChecker {
 	var hosts []string
 	for i := 1; i <= expectedHosts("host-linux-ppc64le-osu"); i++ {
-		name := fmt.Sprintf("go-le-%v", i)
+		name := fmt.Sprintf("host-linux-ppc64le-osu:power_%02d", i)
 		hosts = append(hosts, name)
 	}
 	return &healthChecker{
 		ID:     "osuppc64le",
-		Title:  "OSU linux/ppc64le machines",
+		Title:  "OSU linux/ppc64le POWER8 machines",
+		DocURL: "https://github.com/golang/build/tree/master/env/linux-ppc64le/osuosl",
+		Check:  reverseHostChecker(hosts),
+	}
+}
+
+func newOSUPPC64lePower9Checker() *healthChecker {
+	var hosts []string
+	for i := 1; i <= expectedHosts("host-linux-ppc64le-power9-osu"); i++ {
+		name := fmt.Sprintf("host-linux-ppc64le-power9-osu:power_%02d", i)
+		hosts = append(hosts, name)
+	}
+	return &healthChecker{
+		ID:     "osuppc64lepower9",
+		Title:  "OSU linux/ppc64le POWER9 machines",
 		DocURL: "https://github.com/golang/build/tree/master/env/linux-ppc64le/osuosl",
 		Check:  reverseHostChecker(hosts),
 	}
@@ -561,6 +556,12 @@ func healthCheckerHandler(hc *healthChecker) http.Handler {
 func uptime() time.Duration { return time.Since(processStartTime).Round(time.Second) }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
+	// Support gRPC handlers. handleStatus is our toplevel ("/") handler, so reroute to the gRPC server for
+	// matching requests.
+	if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+		grpcServer.ServeHTTP(w, r)
+		return
+	}
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -579,7 +580,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		HealthCheckers: healthCheckers,
 	}
 	for _, st := range status {
-		if atomic.LoadInt32(&st.hasBuildlet) != 0 {
+		if st.HasBuildlet() {
 			data.ActiveBuilds++
 			data.Active = append(data.Active, st)
 			if st.conf.IsReverse() {
@@ -630,6 +631,8 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	reversePool.WriteHTMLStatus(&buf)
 	data.ReversePoolStatus = template.HTML(buf.String())
+
+	data.SchedState = sched.state()
 
 	buf.Reset()
 	if err := statusTmpl.Execute(&buf, data); err != nil {
@@ -693,6 +696,7 @@ type statusData struct {
 	KubePoolStatus    template.HTML // TODO: embed template
 	ReversePoolStatus template.HTML // TODO: embed template
 	RemoteBuildlets   template.HTML
+	SchedState        schedulerState
 	DiskFree          string
 	Version           string
 	HealthCheckers    []*healthChecker
@@ -727,6 +731,9 @@ var statusTmpl = template.Must(template.New("status").Parse(`
   </li>
 {{end}}</ul>
 
+<h2 id=remote>Remote buildlets <a href='#remote'>¶</a></h2>
+{{.RemoteBuildlets}}
+
 <h2 id=trybots>Active Trybot Runs <a href='#trybots'>¶</a></h2>
 {{- if .TrybotsErr}}
 <b>trybots disabled:</b>: {{.TrybotsErr}}
@@ -734,8 +741,17 @@ var statusTmpl = template.Must(template.New("status").Parse(`
 {{.Trybots}}
 {{end}}
 
-<h2 id=remote>Remote buildlets <a href='#remote'>¶</a></h3>
-{{.RemoteBuildlets}}
+<h2 id=sched>Scheduler State <a href='#sched'>¶</a></h2>
+<ul>
+   {{range .SchedState.HostTypes}}
+       <li><b>{{.HostType}}</b>: {{.Total.Count}} waiting (oldest {{.Total.Oldest}}, newest {{.Total.Newest}}{{if .LastProgress}}, progress {{.LastProgress}}{{end}})
+          {{if or .Gomote.Count .Try.Count}}<ul>
+            {{if .Gomote.Count}}<li>gomote: {{.Gomote.Count}} (oldest {{.Gomote.Oldest}}, newest {{.Gomote.Newest}})</li>{{end}}
+            {{if .Try.Count}}<li>try: {{.Try.Count}} (oldest {{.Try.Oldest}}, newest {{.Try.Newest}})</li>{{end}}
+          </ul>{{end}}
+       </li>
+   {{end}}
+</ul>
 
 <h2 id=pools>Buildlet pools <a href='#pools'>¶</a></h2>
 <ul>
@@ -747,21 +763,21 @@ var statusTmpl = template.Must(template.New("status").Parse(`
 <h2 id=active>Active builds <a href='#active'>¶</a></h2>
 <ul>
 	{{range .Active}}
-	<li><pre>{{.HTMLStatusLine}}</pre></li>
+	<li><pre>{{.HTMLStatusTruncated}}</pre></li>
 	{{end}}
 </ul>
 
 <h2 id=pending>Pending builds <a href='#pending'>¶</a></h2>
 <ul>
 	{{range .Pending}}
-	<li><pre>{{.HTMLStatusLine}}</pre></li>
+	<li><span>{{.HTMLStatusLine}}</span></li>
 	{{end}}
 </ul>
 
 <h2 id=completed>Recently completed <a href='#completed'>¶</a></h2>
 <ul>
 	{{range .Recent}}
-	<li><span>{{.HTMLStatusLine_done}}</span></li>
+	<li><span>{{.HTMLStatusLine}}</span></li>
 	{{end}}
 </ul>
 

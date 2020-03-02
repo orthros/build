@@ -90,10 +90,6 @@ func main() {
 		default:
 			panic(fmt.Sprintf("unknown/unspecified $GO_BUILDER_ENV value %q", env))
 		}
-	case "linux/ppc64":
-		initOregonStatePPC64()
-	case "linux/ppc64le":
-		initOregonStatePPC64le()
 	case "darwin/amd64":
 		// The MacStadium builders' baked-in stage0.sh
 		// bootstrap file doesn't set GO_BUILDER_ENV
@@ -167,6 +163,20 @@ Download:
 	case "host-linux-mipsle-mengzhuo":
 		cmd.Args = append(cmd.Args, reverseHostTypeArgs(buildEnv)...)
 		cmd.Args = append(cmd.Args, os.ExpandEnv("--workdir=${WORKDIR}"))
+	case "host-linux-mips64le-rtrk":
+		cmd.Args = append(cmd.Args, reverseHostTypeArgs(buildEnv)...)
+		cmd.Args = append(cmd.Args, os.ExpandEnv("--workdir=${WORKDIR}"))
+		cmd.Args = append(cmd.Args, os.ExpandEnv("--hostname=${GO_BUILDER_ENV}"))
+	case "host-linux-mips64-rtrk":
+		cmd.Args = append(cmd.Args, reverseHostTypeArgs(buildEnv)...)
+		cmd.Args = append(cmd.Args, os.ExpandEnv("--workdir=${WORKDIR}"))
+		cmd.Args = append(cmd.Args, os.ExpandEnv("--hostname=${GO_BUILDER_ENV}"))
+	case "host-linux-ppc64le-power9-osu":
+		cmd.Args = append(cmd.Args, reverseHostTypeArgs(buildEnv)...)
+	case "host-linux-ppc64le-osu": // power8
+		cmd.Args = append(cmd.Args, reverseHostTypeArgs(buildEnv)...)
+	case "host-linux-ppc64-osu":
+		cmd.Args = append(cmd.Args, reverseHostTypeArgs(buildEnv)...)
 	}
 	switch osArch {
 	case "linux/s390x":
@@ -187,25 +197,8 @@ Download:
 		default:
 			panic(fmt.Sprintf("unknown/unspecified $GO_BUILDER_ENV value %q", env))
 		}
-	case "linux/ppc64":
-		// Assume OSU (osuosl.org) host type for now. If we get more, use
-		// GO_BUILD_HOST_TYPE (see above) and check that.
-		cmd.Args = append(cmd.Args, reverseHostTypeArgs("host-linux-ppc64-osu")...)
-	case "linux/ppc64le":
-		// Assume OSU (osuosl.org) host type for now. If we get more, use
-		// GO_BUILD_HOST_TYPE (see above) and check that.
-		cmd.Args = append(cmd.Args, reverseHostTypeArgs("host-linux-ppc64le-osu")...)
-	case "solaris/amd64":
+	case "solaris/amd64", "illumos/amd64":
 		hostType := buildEnv
-		if hostType == "" {
-			hostType = "host-solaris-amd64"
-		}
-		cmd.Args = append(cmd.Args, reverseHostTypeArgs(hostType)...)
-	case "illumos/amd64":
-		hostType := buildEnv
-		if hostType == "" {
-			hostType = "host-illumos-amd64-joyent"
-		}
 		cmd.Args = append(cmd.Args, reverseHostTypeArgs(hostType)...)
 	}
 	// Release the serial port (if we opened it) so the buildlet
@@ -305,53 +298,25 @@ func isNetworkUp() bool {
 }
 
 func buildletURL() string {
+	if v := os.Getenv("META_BUILDLET_BINARY_URL"); v != "" {
+		return v
+	}
+
 	switch os.Getenv("GO_BUILDER_ENV") {
 	case "linux-arm-arm5spacemonkey":
 		return "https://storage.googleapis.com/go-builder-data/buildlet.linux-arm-arm5"
 	}
-	switch osArch {
-	case "linux/amd64":
-		// Issue 25760: the s390x cross-compile builder is
-		// working under Kubernetes (which sets
-		// IN_KUBERNETES=1 in the env), but isn't working when
-		// run under Docker in COS (a Container-Optimized OS
-		// VM on GCE). Maybe something is hiding the GCE
-		// metadata service from the COS container now. As a
-		// test, just hard code the s390x builder:
-		if os.Getenv("GOARCH") == "s390x" {
-			return "https://storage.googleapis.com/go-builder-data/buildlet.linux-amd64"
-		}
-	case "linux/s390x":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.linux-s390x"
-	case "linux/arm64":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.linux-arm64"
-	case "linux/ppc64":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.linux-ppc64"
-	case "linux/ppc64le":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.linux-ppc64le"
-	case "linux/mips64le":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.linux-mips64le"
-	case "solaris/amd64":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.solaris-amd64"
-	case "illumos/amd64":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.illumos-amd64"
-	case "darwin/amd64":
-		return "https://storage.googleapis.com/go-builder-data/buildlet.darwin-amd64"
-	}
-	// The buildlet download URL is located in an env var
-	// when the buildlet is not running on GCE, or is running
-	// on Kubernetes.
-	if !metadata.OnGCE() || os.Getenv("IN_KUBERNETES") == "1" {
-		if v := os.Getenv("META_BUILDLET_BINARY_URL"); v != "" {
+
+	if metadata.OnGCE() {
+		v, err := metadata.InstanceAttributeValue(attr)
+		if err == nil {
 			return v
 		}
-		sleepFatalf("Not on GCE, and no META_BUILDLET_BINARY_URL specified.")
+		sleepFatalf("on GCE, but no META_BUILDLET_BINARY_URL env or instance attribute %q: %v", attr, err)
 	}
-	v, err := metadata.InstanceAttributeValue(attr)
-	if err != nil {
-		sleepFatalf("Failed to look up %q attribute value: %v", attr, err)
-	}
-	return v
+
+	// Fallback:
+	return fmt.Sprintf("https://storage.googleapis.com/go-builder-data/buildlet.%s-%s", runtime.GOOS, runtime.GOARCH)
 }
 
 func sleepFatalf(format string, args ...interface{}) {
@@ -424,16 +389,6 @@ func initBootstrapDir(destDir, tgzCache string) {
 		log.Fatalf("error untarring %s to %s: %s", tgzCache, destDir, out)
 	}
 	log.Printf("untarred %s to %s in %v", tgzCache, destDir, time.Since(t1).Round(time.Second/10))
-}
-
-func initOregonStatePPC64() {
-	aptGetInstall("gcc", "strace", "libc6-dev", "gdb")
-	initBootstrapDir("/usr/local/go-bootstrap", "/usr/local/go-bootstrap.tar.gz")
-}
-
-func initOregonStatePPC64le() {
-	aptGetInstall("gcc", "strace", "libc6-dev", "gdb")
-	initBootstrapDir("/usr/local/go-bootstrap", "/usr/local/go-bootstrap.tar.gz")
 }
 
 func isUnix() bool {

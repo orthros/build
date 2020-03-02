@@ -43,11 +43,15 @@ type change struct {
 	LastUpdate          time.Time
 	FormattedLastUpdate string
 
-	HasPlusTwo      bool
-	HasPlusOne      bool
-	HasMinusTwo     bool
-	NoHumanComments bool
-	SearchTerms     string
+	HasPlusTwo       bool
+	HasPlusOne       bool
+	HasMinusOne      bool
+	HasMinusTwo      bool
+	NoHumanComments  bool
+	TryBotMinusOne   bool
+	TryBotPlusOne    bool
+	SearchTerms      string
+	ReleaseMilestone string
 }
 
 type reviewsData struct {
@@ -118,36 +122,11 @@ func (s *server) updateReviewsData() {
 	var (
 		projects     []*project
 		totalChanges int
-
-		excludedProjects = map[string]bool{
-			"gocloud":              true,
-			"google-api-go-client": true,
-		}
-		deletedChanges = map[struct {
-			proj string
-			num  int32
-		}]bool{
-			{"crypto", 35958}:  true,
-			{"scratch", 71730}: true,
-			{"scratch", 71850}: true,
-			{"scratch", 72090}: true,
-			{"scratch", 72091}: true,
-			{"scratch", 72110}: true,
-			{"scratch", 72131}: true,
-			{"tools", 93515}:   true,
-		}
 	)
-	s.corpus.Gerrit().ForeachProjectUnsorted(func(p *maintner.GerritProject) error {
-		if excludedProjects[p.Project()] {
-			return nil
-		}
+	s.corpus.Gerrit().ForeachProjectUnsorted(filterProjects(func(p *maintner.GerritProject) error {
 		proj := &project{GerritProject: p}
-		p.ForeachOpenCL(func(cl *maintner.GerritCL) error {
-			if deletedChanges[struct {
-				proj string
-				num  int32
-			}{p.Project(), cl.Number}] ||
-				cl.WorkInProgress() ||
+		p.ForeachOpenCL(withoutDeletedCLs(p, func(cl *maintner.GerritCL) error {
+			if cl.WorkInProgress() ||
 				cl.Owner() == nil ||
 				strings.Contains(cl.Commit.Msg, "DO NOT REVIEW") {
 				return nil
@@ -171,6 +150,20 @@ func (s *server) updateReviewsData() {
 			if c.NoHumanComments {
 				searchTerms = append(searchTerms, "t:attn")
 			}
+
+			const releaseMilestonePrefix = "Go"
+			for _, ref := range cl.GitHubIssueRefs {
+				issue := ref.Repo.Issue(ref.Number)
+				if issue != nil &&
+					issue.Milestone != nil &&
+					strings.HasPrefix(issue.Milestone.Title, releaseMilestonePrefix) {
+					c.ReleaseMilestone = issue.Milestone.Title[len(releaseMilestonePrefix):]
+				}
+			}
+			if c.ReleaseMilestone != "" {
+				searchTerms = append(searchTerms, "release:"+c.ReleaseMilestone)
+			}
+
 			searchTerms = append(searchTerms, searchTermsFromReviewerFields(cl)...)
 			for label, votes := range cl.Metas[len(cl.Metas)-1].LabelVotes() {
 				for _, val := range votes {
@@ -179,12 +172,25 @@ func (s *server) updateReviewsData() {
 						case -2:
 							c.HasMinusTwo = true
 							searchTerms = append(searchTerms, "t:-2")
+						case -1:
+							c.HasMinusOne = true
+							searchTerms = append(searchTerms, "t:-1")
 						case 1:
 							c.HasPlusOne = true
 							searchTerms = append(searchTerms, "t:+1")
 						case 2:
 							c.HasPlusTwo = true
 							searchTerms = append(searchTerms, "t:+2")
+						}
+					}
+					if label == "TryBot-Result" {
+						switch val {
+						case -1:
+							c.TryBotMinusOne = true
+							searchTerms = append(searchTerms, "trybot:-1")
+						case 1:
+							c.TryBotPlusOne = true
+							searchTerms = append(searchTerms, "trybot:+1")
 						}
 					}
 				}
@@ -200,13 +206,13 @@ func (s *server) updateReviewsData() {
 			proj.Changes = append(proj.Changes, c)
 			totalChanges++
 			return nil
-		})
+		}))
 		sort.Slice(proj.Changes, func(i, j int) bool {
 			return proj.Changes[i].LastUpdate.Before(proj.Changes[j].LastUpdate)
 		})
 		projects = append(projects, proj)
 		return nil
-	})
+	}))
 	sort.Slice(projects, func(i, j int) bool {
 		return projects[i].Project() < projects[j].Project()
 	})

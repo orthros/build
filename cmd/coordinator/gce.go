@@ -116,7 +116,7 @@ func initGCE() error {
 
 		// Convert the zone from "projects/1234/zones/us-central1-a" to "us-central1-a".
 		projectZone = path.Base(projectZone)
-		buildEnv.Zone = projectZone
+		buildEnv.ControlZone = projectZone
 
 		if buildEnv.StaticIP == "" {
 			buildEnv.StaticIP, err = metadata.ExternalIP()
@@ -321,7 +321,9 @@ func (p *gceBuildletPool) GetBuildlet(ctx context.Context, hostType string, lg l
 		curSpan      = createSpan // either instSpan or waitBuildlet
 	)
 
-	log.Printf("Creating GCE VM %q for %s", instName, hostType)
+	zone := buildEnv.RandomVMZone()
+
+	log.Printf("Creating GCE VM %q for %s at %s", instName, hostType, zone)
 	bc, err = buildlet.StartNewVM(gcpCreds, buildEnv, instName, hostType, buildlet.VMOpts{
 		DeleteIn: deleteIn,
 		OnInstanceRequested: func() {
@@ -334,15 +336,16 @@ func (p *gceBuildletPool) GetBuildlet(ctx context.Context, hostType string, lg l
 			waitBuildlet = lg.CreateSpan("wait_buildlet_start", instName)
 			curSpan = waitBuildlet
 		},
-		OnGotInstanceInfo: func() {
+		OnGotInstanceInfo: func(*compute.Instance) {
 			lg.LogEventTime("got_instance_info", "waiting_for_buildlet...")
 		},
+		Zone: zone,
 	})
 	if err != nil {
 		curSpan.Done(err)
-		log.Printf("Failed to create VM for %s: %v", hostType, err)
+		log.Printf("Failed to create VM for %s at %s: %v", hostType, zone, err)
 		if needDelete {
-			deleteVM(buildEnv.Zone, instName)
+			deleteVM(zone, instName)
 			p.putVMCountQuota(hconf.GCENumCPU())
 		}
 		p.setInstanceUsed(instName, false)
@@ -350,13 +353,14 @@ func (p *gceBuildletPool) GetBuildlet(ctx context.Context, hostType string, lg l
 	}
 	waitBuildlet.Done(nil)
 	bc.SetDescription("GCE VM: " + instName)
+	bc.SetGCEInstanceName(instName)
 	bc.SetOnHeartbeatFailure(func() {
-		p.putBuildlet(bc, hostType, instName)
+		p.putBuildlet(bc, hostType, zone, instName)
 	})
 	return bc, nil
 }
 
-func (p *gceBuildletPool) putBuildlet(bc *buildlet.Client, hostType, instName string) error {
+func (p *gceBuildletPool) putBuildlet(bc *buildlet.Client, hostType, zone, instName string) error {
 	// TODO(bradfitz): add the buildlet to a freelist (of max N
 	// items) for up to 10 minutes since when it got started if
 	// it's never seen a command execution failure, and we can
@@ -366,7 +370,7 @@ func (p *gceBuildletPool) putBuildlet(bc *buildlet.Client, hostType, instName st
 	// buildlet client library between Close, Destroy/Halt, and
 	// tracking execution errors.  That was all half-baked before
 	// and thus removed. Now Close always destroys everything.
-	deleteVM(buildEnv.Zone, instName)
+	deleteVM(zone, instName)
 	p.setInstanceUsed(instName, false)
 
 	hconf, ok := dashboard.Hosts[hostType]
@@ -421,17 +425,6 @@ func (p *gceBuildletPool) awaitVMCountQuota(ctx context.Context, numCPU int) err
 			return ctx.Err()
 		}
 	}
-}
-
-func (p *gceBuildletPool) HasCapacity(hostType string) bool {
-	hconf, ok := dashboard.Hosts[hostType]
-	if !ok {
-		return false
-	}
-	numCPU := hconf.GCENumCPU()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.haveQuotaLocked(numCPU)
 }
 
 // haveQuotaLocked reports whether the current GCE quota permits
@@ -539,7 +532,7 @@ func (p *gceBuildletPool) cleanUpOldVMs() {
 	// and Region.Zones: http://godoc.org/google.golang.org/api/compute/v1#Region
 
 	for {
-		for _, zone := range buildEnv.ZonesToClean {
+		for _, zone := range buildEnv.VMZones {
 			if err := p.cleanZoneVMs(zone); err != nil {
 				log.Printf("Error cleaning VMs in zone %q: %v", zone, err)
 			}
@@ -551,11 +544,11 @@ func (p *gceBuildletPool) cleanUpOldVMs() {
 // cleanZoneVMs is part of cleanUpOldVMs, operating on a single zone.
 func (p *gceBuildletPool) cleanZoneVMs(zone string) error {
 	// Fetch the first 500 (default) running instances and clean
-	// thoes. We expect that we'll be running many fewer than
+	// those. We expect that we'll be running many fewer than
 	// that. Even if we have more, eventually the first 500 will
 	// either end or be cleaned, and then the next call will get a
 	// partially-different 500.
-	// TODO(bradfitz): revist this code if we ever start running
+	// TODO(bradfitz): revisit this code if we ever start running
 	// thousands of VMs.
 	gceAPIGate()
 	list, err := computeService.Instances.List(buildEnv.ProjectName, zone).Do()
@@ -565,6 +558,11 @@ func (p *gceBuildletPool) cleanZoneVMs(zone string) error {
 	for _, inst := range list.Items {
 		if inst.Metadata == nil {
 			// Defensive. Not seen in practice.
+			continue
+		}
+		if isGCERemoteBuildlet(inst.Name) {
+			// Remote buildlets have their own expiration mechanism that respects active SSH sessions.
+			log.Printf("cleanZoneVMs: skipping remote buildlet %q", inst.Name)
 			continue
 		}
 		var sawDeleteAt bool

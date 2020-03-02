@@ -759,6 +759,15 @@ func (gp *GerritProject) processMutation(gm *maintpb.GerritMutation) {
 		}
 	}
 
+	for _, refName := range gm.DeletedRefs {
+		delete(gp.ref, refName)
+		// TODO: this doesn't delete change refs (from
+		// gp.remote) yet, mostly because those don't tend to
+		// ever get deleted and we haven't yet needed it. If
+		// we ever need it, the mutation generation side would
+		// also need to be updated.
+	}
+
 	for _, refp := range gm.Refs {
 		refName := refp.Ref
 		hash := c.gitHashFromHexStr(refp.Sha1)
@@ -1024,21 +1033,46 @@ func (gp *GerritProject) syncOnce(ctx context.Context) error {
 	c := gp.gerrit.c
 	gitDir := gp.gitDir()
 
-	fetchCtx, cancel := context.WithTimeout(ctx, time.Minute)
-	cmd := exec.CommandContext(fetchCtx, "git", "fetch", "origin")
+	t0 := time.Now()
+	cmd := exec.CommandContext(ctx, "git", "fetch", "origin")
 	cmd.Dir = gitDir
-	out, err := cmd.CombinedOutput()
-	cancel()
-	if err != nil {
-		return fmt.Errorf("git fetch origin: %v, %s", err, out)
-	}
+	// Enable extra Git tracing in case the fetch hangs.
+	cmd.Env = append(os.Environ(),
+		"GIT_TRACE2_EVENT=1",
+		"GIT_TRACE_CURL_NO_DATA=1",
+	)
+	cmd.Stdout = new(bytes.Buffer)
+	cmd.Stderr = cmd.Stdout
 
+	// The 'git fetch' needs a timeout in case it hangs, but to avoid spurious
+	// timeouts (and live-lock) the timeout should be (at least) an order of
+	// magnitude longer than we expect the operation to actually take. Moreover,
+	// exec.CommandContext sends SIGKILL, which may terminate the command without
+	// giving it a chance to flush useful trace entries, so we'll terminate it
+	// manually instead (see https://golang.org/issue/22757).
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("git fetch origin: %v", err)
+	}
+	timer := time.AfterFunc(10*time.Minute, func() {
+		cmd.Process.Signal(os.Interrupt)
+	})
+	err := cmd.Wait()
+	fetchDuration := time.Since(t0).Round(time.Millisecond)
+	timer.Stop()
+	if err != nil {
+		return fmt.Errorf("git fetch origin: %v after %v, %s", err, fetchDuration, cmd.Stdout)
+	}
+	gp.logf("ran git fetch origin in %v", fetchDuration)
+
+	t0 = time.Now()
 	cmd = exec.CommandContext(ctx, "git", "ls-remote")
 	cmd.Dir = gitDir
-	out, err = cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
+	lsRemoteDuration := time.Since(t0).Round(time.Millisecond)
 	if err != nil {
-		return fmt.Errorf("git ls-remote in %s: %v, %s", gitDir, err, out)
+		return fmt.Errorf("git ls-remote in %s: %v after %v, %s", gitDir, err, lsRemoteDuration, out)
 	}
+	gp.logf("ran git ls-remote in %v", lsRemoteDuration)
 
 	var changedRefs []*maintpb.GitRef
 	var toFetch []GitHash
@@ -1050,6 +1084,7 @@ func (gp *GerritProject) syncOnce(ctx context.Context) error {
 	// it's not actually around I/O: all the input from ls-remote has
 	// already been slurped into memory.
 	c.mu.Lock()
+	refExists := map[string]bool{} // whether ref is this ls-remote fetch
 	for bs.Scan() {
 		line := bs.Bytes()
 		tab := bytes.IndexByte(line, '\t')
@@ -1061,6 +1096,7 @@ func (gp *GerritProject) syncOnce(ctx context.Context) error {
 		}
 		sha1 := string(line[:tab])
 		refName := strings.TrimSpace(string(line[tab+1:]))
+		refExists[refName] = true
 		hash := c.gitHashFromHexStr(sha1)
 
 		var needFetch bool
@@ -1076,7 +1112,7 @@ func (gp *GerritProject) syncOnce(ctx context.Context) error {
 			needFetch = curHash != hash
 		} else if trackGerritRef(refName) && gp.ref[refName] != hash {
 			needFetch = true
-			gp.logf("gerrit ref %q = %q", refName, sha1)
+			gp.logf("ref %q = %q", refName, sha1)
 		}
 
 		if needFetch {
@@ -1087,9 +1123,26 @@ func (gp *GerritProject) syncOnce(ctx context.Context) error {
 			})
 		}
 	}
+	var deletedRefs []string
+	for n := range gp.ref {
+		if !refExists[n] {
+			gp.logf("ref %q now deleted", n)
+			deletedRefs = append(deletedRefs, n)
+		}
+	}
 	c.mu.Unlock()
+
 	if err := bs.Err(); err != nil {
+		gp.logf("ls-remote scanning error: %v", err)
 		return err
+	}
+	if len(deletedRefs) > 0 {
+		c.addMutation(&maintpb.Mutation{
+			Gerrit: &maintpb.GerritMutation{
+				Project:     gp.proj,
+				DeletedRefs: deletedRefs,
+			},
+		})
 	}
 	if len(changedRefs) == 0 {
 		return nil
@@ -1125,6 +1178,7 @@ func (gp *GerritProject) syncOnce(ctx context.Context) error {
 			}})
 		changedRefs = changedRefs[len(batch):]
 	}
+
 	return nil
 }
 
@@ -1176,13 +1230,16 @@ func (gp *GerritProject) fetchHashes(ctx context.Context, hashes []GitHash) erro
 		args = append(args, hash.String())
 	}
 	gp.logf("fetching %v hashes...", len(hashes))
+	t0 := time.Now()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = gp.gitDir()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("error fetching %d hashes from gerrit project %s: %s", len(hashes), gp.proj, out)
+	out, err := cmd.CombinedOutput()
+	d := time.Since(t0).Round(time.Millisecond)
+	if err != nil {
+		gp.logf("error fetching %d hashes after %v: %s", len(hashes), d, out)
 		return err
 	}
-	gp.logf("fetched %v hashes.", len(hashes))
+	gp.logf("fetched %v hashes in %v", len(hashes), d)
 	return nil
 }
 

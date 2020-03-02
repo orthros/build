@@ -71,7 +71,7 @@ type VMOpts struct {
 
 	// OnInstanceCreated optionally specifies a hook to run synchronously
 	// after the computeService.Instances.Get call.
-	OnGotInstanceInfo func()
+	OnGotInstanceInfo func(*compute.Instance)
 
 	// OnBeginBuildletProbe optionally specifies a hook to run synchronously
 	// before StartNewVM tries to hit buildletURL to see if it's up yet.
@@ -96,8 +96,9 @@ func StartNewVM(creds *google.Credentials, buildEnv *buildenv.Environment, instN
 		opts.ProjectID = buildEnv.ProjectName
 	}
 	if opts.Zone == "" {
-		opts.Zone = buildEnv.Zone
+		opts.Zone = buildEnv.RandomVMZone()
 	}
+	zone := opts.Zone
 	if opts.DeleteIn == 0 {
 		opts.DeleteIn = 30 * time.Minute
 	}
@@ -110,12 +111,6 @@ func StartNewVM(creds *google.Credentials, buildEnv *buildenv.Environment, instN
 		return nil, fmt.Errorf("host %q is type %q; want either a VM or container type", hostType, hconf.PoolName())
 	}
 
-	zone := opts.Zone
-	if zone == "" {
-		// TODO: automatic? maybe that's not useful.
-		// For now just return an error.
-		return nil, errors.New("buildlet: missing required Zone option")
-	}
 	projectID := opts.ProjectID
 	if projectID == "" {
 		return nil, errors.New("buildlet: missing required ProjectID option")
@@ -200,16 +195,12 @@ func StartNewVM(creds *google.Credentials, buildEnv *buildenv.Environment, instN
 		Scheduling: &compute.Scheduling{Preemptible: false},
 	}
 
-	// Container builders use the COS image, which defaults to
-	// logging to Cloud Logging, which requires the default
-	// service account. So enable it when needed.
-	// TODO: reduce this scope in the future, when we go wild with IAM.
-	if hconf.IsContainer() {
+	// Container builders use the COS image, which defaults to logging to Cloud Logging.
+	// Permission is granted to this service account.
+	if hconf.IsContainer() && buildEnv.COSServiceAccount != "" {
 		instance.ServiceAccounts = []*compute.ServiceAccount{
 			{
-				// This funky email address is the
-				// "default service account" for GCE VMs:
-				Email:  fmt.Sprintf("%v-compute@developer.gserviceaccount.com", buildEnv.ProjectNumber),
+				Email:  buildEnv.COSServiceAccount,
 				Scopes: []string{compute.CloudPlatformScope},
 			},
 		}
@@ -328,7 +319,9 @@ OpLoop:
 		buildletURL = "http://" + intIP
 		ipPort = intIP + ":80"
 	}
-	condRun(opts.OnGotInstanceInfo)
+	if opts.OnGotInstanceInfo != nil {
+		opts.OnGotInstanceInfo(inst)
+	}
 
 	const timeout = 5 * time.Minute
 	var alive bool

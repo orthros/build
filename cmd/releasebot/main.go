@@ -79,7 +79,10 @@ func main() {
 
 	release := flag.Arg(0)
 
-	if strings.Contains(release, "beta") || strings.Contains(release, "rc") {
+	isBeta := strings.Contains(release, "beta")
+	isRC := strings.Contains(release, "rc")
+
+	if isBeta || isRC {
 		if *security {
 			log.Printf("error: only minor releases are supported in security mode")
 			usage()
@@ -87,8 +90,8 @@ func main() {
 		w := &Work{
 			Prepare:     *modeFlag == "prepare",
 			Version:     release,
-			BetaRelease: strings.Contains(release, "beta"),
-			RCRelease:   strings.Contains(release, "rc"),
+			BetaRelease: isBeta,
+			RCRelease:   isRC,
 		}
 		w.doRelease()
 		return
@@ -299,9 +302,11 @@ func (w *Work) doRelease() {
 
 	if w.BetaRelease {
 		w.ReleaseBranch = "master"
+
 	} else if w.RCRelease {
 		shortRel := strings.Split(w.Version, "rc")[0]
 		w.ReleaseBranch = "release-branch." + shortRel
+
 	} else if strings.Count(w.Version, ".") == 1 {
 		// Major release like "go1.X".
 		if w.Security {
@@ -327,6 +332,11 @@ func (w *Work) doRelease() {
 
 	w.checkSpelling()
 	w.gitCheckout()
+
+	if !w.Security {
+		w.mustIncludeSecurityBranch()
+	}
+
 	// In release mode we carry on even if the tag exists, in case we
 	// need to resume a failed build.
 	if w.Prepare && w.gitTagExists() {
@@ -535,15 +545,6 @@ func (w *Work) checkDocs() {
 	if !strings.Contains(string(data), major) {
 		w.logError("doc/contrib.html does not list major version %s", major)
 	}
-
-	// Check that the release is listed on the release history page.
-	data, err = ioutil.ReadFile(filepath.Join(w.Dir, "gitwork", "doc/devel/release.html"))
-	if err != nil {
-		w.log.Panic(err)
-	}
-	if !strings.Contains(string(data), w.Version+" (released ") {
-		w.logError("doc/devel/release.html does not document %s", w.Version)
-	}
 }
 
 // major takes a go version like "go1.5", "go1.5.1", "go1.5.2", etc.,
@@ -698,8 +699,6 @@ func (w *Work) buildRelease(target string) {
 	switch {
 	case strings.HasPrefix(target, "windows-"):
 		files = []string{prefix + "zip", prefix + "msi"}
-	case strings.HasPrefix(target, "darwin-"):
-		files = []string{prefix + "tar.gz", prefix + "pkg"}
 	default:
 		files = []string{prefix + "tar.gz"}
 	}
@@ -725,10 +724,8 @@ func (w *Work) buildRelease(target string) {
 	} else {
 		failures := 0
 		for {
-			releaseBranch := strings.TrimSuffix(w.ReleaseBranch, "-security")
 			args := []string{w.ReleaseBinary, "-target", target, "-user", gomoteUser,
-				"-version", w.Version, "-tools", releaseBranch, "-net", releaseBranch,
-				"-staging_dir", w.StagingDir}
+				"-version", w.Version, "-staging_dir", w.StagingDir}
 			if w.Security {
 				args = append(args, "-tarball", filepath.Join(w.Dir, w.VersionCommit+".tar.gz"))
 			} else {
@@ -737,7 +734,10 @@ func (w *Work) buildRelease(target string) {
 			// The prepare step will run the tests on a commit that has the same
 			// tree (but maybe different message) as the one that the release
 			// step will process, so we can skip tests the second time.
-			if !w.Prepare {
+			// For beta releases, we're releasing from master. Beta releases
+			// should not skip tests, as a new commit may have been pushed after
+			// the prepare step.
+			if !w.Prepare && !w.BetaRelease {
 				args = append(args, "-skip_tests")
 			}
 			out, err := w.runner(releaseDir, "GOPATH="+filepath.Join(w.Dir, "gopath")).runErr(args...)
@@ -820,4 +820,25 @@ func (w *Work) uploadStagingRelease(target string, out *ReleaseOutput) error {
 	out.Link = "https://" + releaseBucket + ".storage.googleapis.com/" + dst
 	w.releaseMu.Unlock()
 	return nil
+}
+
+// mustIncludeSecurityBranch remotely checks if there is an associated release branch
+// for the current release. If one exists, it ensures that the HEAD commit in the latest
+// security release branch exists within the current release branch. If the latest security
+// branch has changes which have not been merged into the proposed release, it will exit
+// fatally. If an asssociated security release branch does not exist, the function will
+// return without doing the check. It assumes that if the security branch doesn't exist,
+// it's because it was already merged everywhere and deleted.
+func (w *Work) mustIncludeSecurityBranch() {
+	securityReleaseBranch := fmt.Sprintf("%s-security", w.ReleaseBranch)
+
+	sha, ok := w.gitRemoteBranchCommit(privateGoRepoURL, securityReleaseBranch)
+	if !ok {
+		w.log.Printf("an associated security release branch %q does not exist; assuming it has been merged and deleted, so proceeding as usual", securityReleaseBranch)
+		return
+	}
+
+	if !w.gitCommitExistsInBranch(sha) {
+		log.Fatalf("release branch does not contain security release HEAD commit %q; aborting", sha)
+	}
 }

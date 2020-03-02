@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"golang.org/x/build/buildenv"
+	"golang.org/x/build/dashboard"
 	"golang.org/x/build/internal/buildgo"
 	"golang.org/x/build/maintner/maintnerd/apipb"
 )
@@ -188,16 +189,14 @@ func TestFindWork(t *testing.T) {
 		return false
 	}
 
-	c := make(chan buildgo.BuilderRev, 1000)
-	go func() {
-		defer close(c)
-		err := findWork(c)
-		if err != nil {
-			t.Error(err)
-		}
-	}()
-	for br := range c {
-		t.Logf("Got: %v", br)
+	addWorkTestHook = func(work buildgo.BuilderRev, d *commitDetail) {
+		t.Logf("Got: %v, %+v", work, d)
+	}
+	defer func() { addWorkTestHook = nil }()
+
+	err := findWork()
+	if err != nil {
+		t.Error(err)
 	}
 }
 
@@ -209,5 +208,136 @@ func TestBuildersJSON(t *testing.T) {
 		var buf bytes.Buffer
 		res.Write(&buf)
 		t.Error(buf.String())
+	}
+}
+
+func mustConf(t *testing.T, name string) *dashboard.BuildConfig {
+	conf, ok := dashboard.Builders[name]
+	if !ok {
+		t.Fatalf("unknown builder %q", name)
+	}
+	return conf
+}
+
+func TestSlowBotsFromComments(t *testing.T) {
+	existing := []*dashboard.BuildConfig{mustConf(t, "linux-amd64")}
+	work := &apipb.GerritTryWorkItem{
+		Version: 2,
+		TryMessage: []*apipb.TryVoteMessage{
+			{
+				Version: 1,
+				Message: "ios",
+			},
+			{
+				Version: 2,
+				Message: "arm64, mac aix ",
+			},
+			{
+				Version: 1,
+				Message: "aix",
+			},
+		},
+	}
+	extra := slowBotsFromComments(work, existing)
+	var got []string
+	for _, bc := range extra {
+		got = append(got, bc.Name)
+	}
+	want := []string{"aix-ppc64", "darwin-amd64-10_14", "linux-arm64-packet"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("mismatch:\n got: %q\nwant: %q\n", got, want)
+	}
+}
+
+func TestSubreposFromComments(t *testing.T) {
+	work := &apipb.GerritTryWorkItem{
+		Version: 2,
+		TryMessage: []*apipb.TryVoteMessage{
+			{
+				Version: 2,
+				Message: "x/build, x/sync x/tools, x/sync",
+			},
+		},
+	}
+	got := xReposFromComments(work)
+	want := map[string]bool{
+		"build": true,
+		"sync":  true,
+		"tools": true,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("mismatch:\n got: %v\nwant: %v\n", got, want)
+	}
+}
+
+func TestBuildStatusFormat(t *testing.T) {
+	for i, tt := range []struct {
+		st   *buildStatus
+		want string
+	}{
+		{
+			st: &buildStatus{
+				trySet: &trySet{
+					tryKey: tryKey{
+						Project: "go",
+					},
+				},
+				BuilderRev: buildgo.BuilderRev{
+					Name:    "linux-amd64",
+					SubName: "tools",
+				},
+			},
+			want: "(x/tools) linux-amd64",
+		},
+		{
+			st: &buildStatus{
+				trySet: &trySet{
+					tryKey: tryKey{
+						Project: "tools",
+					},
+				},
+				BuilderRev: buildgo.BuilderRev{
+					Name:    "linux-amd64",
+					SubName: "tools",
+				},
+				goBranch: "release-branch.go1.15",
+			},
+			want: "linux-amd64 (Go 1.15.x)",
+		},
+		{
+			st: &buildStatus{
+				trySet: &trySet{
+					tryKey: tryKey{
+						Project: "go",
+					},
+				},
+				BuilderRev: buildgo.BuilderRev{
+					Name:    "linux-amd64",
+					SubName: "tools",
+				},
+			},
+			want: "(x/tools) linux-amd64",
+		},
+		{
+			st: &buildStatus{
+				BuilderRev: buildgo.BuilderRev{
+					Name: "darwin-amd64-10_14",
+				},
+			},
+			want: "darwin-amd64-10_14",
+		},
+		{
+			st: &buildStatus{
+				BuilderRev: buildgo.BuilderRev{
+					Name: "darwin-amd64-10_14",
+				},
+				goBranch: "release-branch.go1.15",
+			},
+			want: "darwin-amd64-10_14 (Go 1.15.x)",
+		},
+	} {
+		if got := tt.st.NameAndBranch(); got != tt.want {
+			t.Errorf("%d: NameAndBranch = %q; want %q", i, got, tt.want)
+		}
 	}
 }

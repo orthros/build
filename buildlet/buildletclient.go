@@ -110,6 +110,19 @@ func (c *Client) SetDescription(v string) {
 	c.desc = v
 }
 
+// SetGCEInstanceName sets an instance name for GCE buildlets.
+// This value differs from the buildlet name used in the CLI and web interface.
+func (c *Client) SetGCEInstanceName(v string) {
+	c.gceInstanceName = v
+}
+
+// GCEInstanceName gets an instance name for GCE buildlets.
+// This value differs from the buildlet name used in the CLI and web interface.
+// For non-GCE buildlets, this will return an empty string.
+func (c *Client) GCEInstanceName() string {
+	return c.gceInstanceName
+}
+
 // SetHTTPClient replaces the underlying HTTP client.
 // It should only be called before the Client is used.
 func (c *Client) SetHTTPClient(httpClient *http.Client) {
@@ -141,14 +154,16 @@ func defaultDialer() func(network, addr string) (net.Conn, error) {
 
 // A Client interacts with a single buildlet.
 type Client struct {
-	ipPort         string // required, unless remoteBuildlet+baseURL is set
-	tls            KeyPair
-	httpClient     *http.Client
-	dialer         func(context.Context) (net.Conn, error) // nil means to use net.Dialer.DialContext
-	baseURL        string                                  // optional baseURL (used by remote buildlets)
-	authUser       string                                  // defaults to "gomote", if password is non-empty
-	password       string                                  // basic auth password or empty for none
-	remoteBuildlet string                                  // non-empty if for remote buildlets
+	ipPort          string // required, unless remoteBuildlet+baseURL is set
+	tls             KeyPair
+	httpClient      *http.Client
+	dialer          func(context.Context) (net.Conn, error) // nil means to use net.Dialer.DialContext
+	baseURL         string                                  // optional baseURL (used by remote buildlets)
+	authUser        string                                  // defaults to "gomote", if password is non-empty
+	password        string                                  // basic auth password or empty for none
+	remoteBuildlet  string                                  // non-empty if for remote buildlets (used by client)
+	name            string                                  // optional name for debugging, returned by Name
+	gceInstanceName string                                  // instance name for GCE VMs
 
 	closeFuncs  []func() // optional extra code to run on close
 	releaseMode bool
@@ -187,7 +202,7 @@ func (c *Client) String() string {
 
 // RemoteName returns the name of this client's buildlet on the
 // coordinator. If this buildlet isn't a remote buildlet created via
-// a buildlet, this returns the empty string.
+// gomote, this returns the empty string.
 func (c *Client) RemoteName() string {
 	return c.remoteBuildlet
 }
@@ -205,7 +220,19 @@ func (c *Client) URL() string {
 
 func (c *Client) IPPort() string { return c.ipPort }
 
+func (c *Client) SetName(name string) { c.name = name }
+
+// Name returns the name of this buildlet.
+// It returns the first non-empty string from the name given to
+// SetName, its remote buildlet name, its ip:port, or "(unnamed-buildlet)" in the case where
+// ip:port is empty because there's a custom dialer.
 func (c *Client) Name() string {
+	if c.name != "" {
+		return c.name
+	}
+	if c.remoteBuildlet != "" {
+		return c.remoteBuildlet
+	}
 	if c.ipPort != "" {
 		return c.ipPort
 	}
@@ -235,9 +262,6 @@ func (c *Client) authUsername() string {
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
-	if req.Cancel == nil {
-		req.Cancel = c.ctx.Done()
-	}
 	c.initHeartbeatOnce.Do(c.initHeartbeats)
 	if c.password != "" {
 		req.SetBasicAuth(c.authUsername(), c.password)
@@ -246,6 +270,37 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 		req.Header.Set("X-Buildlet-Proxy", c.remoteBuildlet)
 	}
 	return c.httpClient.Do(req)
+}
+
+// ProxyTCP connects to the given port on the remote buildlet.
+// The buildlet client must currently be a gomote client (RemoteName != "")
+// and the target type must be a VM type running on GCE. This was primarily
+// created for RDP to Windows machines, but it might get reused for other
+// purposes in the future.
+func (c *Client) ProxyTCP(port int) (io.ReadWriteCloser, error) {
+	if c.RemoteName() == "" {
+		return nil, errors.New("ProxyTCP currently only supports gomote-created buildlets")
+	}
+	req, err := http.NewRequest("POST", c.URL()+"/tcpproxy", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("X-Target-Port", fmt.Sprint(port))
+	res, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != http.StatusSwitchingProtocols {
+		slurp, _ := ioutil.ReadAll(io.LimitReader(res.Body, 4<<10))
+		res.Body.Close()
+		return nil, fmt.Errorf("wanted 101 Switching Protocols; unexpected response: %v, %q", res.Status, slurp)
+	}
+	rwc, ok := res.Body.(io.ReadWriteCloser)
+	if !ok {
+		res.Body.Close()
+		return nil, fmt.Errorf("tcpproxy response was not a Writer")
+	}
+	return rwc, nil
 }
 
 // ProxyRoundTripper returns a RoundTripper that sends HTTP requests directly
@@ -282,7 +337,7 @@ func (c *Client) heartbeatLoop() {
 			return
 		case <-time.After(10 * time.Second):
 			t0 := time.Now()
-			if _, err := c.Status(); err != nil {
+			if _, err := c.Status(context.Background()); err != nil {
 				failInARow++
 				if failInARow == 3 {
 					log.Printf("Buildlet %v failed three heartbeats; final error: %v", c, err)
@@ -305,11 +360,12 @@ func (c *Client) doHeaderTimeout(req *http.Request, max time.Duration) (res *htt
 		err error
 	}
 
-	if req.Cancel != nil {
-		panic("use of Request.Cancel inside the buildlet package is reserved for doHeaderTimeout")
-	}
-	cancelc := make(chan struct{}) // closed to abort
-	req.Cancel = cancelc
+	ctx, cancel := context.WithCancel(req.Context())
+
+	req = req.WithContext(ctx)
+
+	timer := time.NewTimer(max)
+	defer timer.Stop()
 
 	resErrc := make(chan resErr, 1)
 	go func() {
@@ -317,11 +373,8 @@ func (c *Client) doHeaderTimeout(req *http.Request, max time.Duration) (res *htt
 		resErrc <- resErr{res, err}
 	}()
 
-	timer := time.NewTimer(max)
-	defer timer.Stop()
-
 	cleanup := func() {
-		close(cancelc)
+		cancel()
 		if re := <-resErrc; re.res != nil {
 			re.res.Body.Close()
 		}
@@ -329,11 +382,20 @@ func (c *Client) doHeaderTimeout(req *http.Request, max time.Duration) (res *htt
 
 	select {
 	case re := <-resErrc:
-		return re.res, re.err
+		if re.err != nil {
+			cancel()
+			return nil, re.err
+		}
+		// Clean up our cancel context above when the caller
+		// reads to the end of the response body or closes.
+		re.res.Body = onEOFReadCloser{re.res.Body, cancel}
+		return re.res, nil
 	case <-c.peerDead:
+		log.Printf("%s: peer dead with %v, waiting for headers for %v", c.Name(), c.deadErr, req.URL.Path)
 		go cleanup()
 		return nil, c.deadErr
 	case <-timer.C:
+		log.Printf("%s: timeout after %v waiting for headers for %v", c.Name(), max, req.URL.Path)
 		go cleanup()
 		return nil, errHeaderTimeout
 	}
@@ -358,12 +420,12 @@ func (c *Client) doOK(req *http.Request) error {
 // If dir is empty, they're placed at the root of the buildlet's work directory.
 // The dir is created if necessary.
 // The Reader must be of a tar.gz file.
-func (c *Client) PutTar(r io.Reader, dir string) error {
+func (c *Client) PutTar(ctx context.Context, r io.Reader, dir string) error {
 	req, err := http.NewRequest("PUT", c.URL()+"/writetgz?dir="+url.QueryEscape(dir), r)
 	if err != nil {
 		return err
 	}
-	return c.doOK(req)
+	return c.doOK(req.WithContext(ctx))
 }
 
 // PutTarFromURL tells the buildlet to download the tar.gz file from tarURL
@@ -371,7 +433,7 @@ func (c *Client) PutTar(r io.Reader, dir string) error {
 // If dir is empty, they're placed at the root of the buildlet's work directory.
 // The dir is created if necessary.
 // The url must be of a tar.gz file.
-func (c *Client) PutTarFromURL(tarURL, dir string) error {
+func (c *Client) PutTarFromURL(ctx context.Context, tarURL, dir string) error {
 	form := url.Values{
 		"url": {tarURL},
 	}
@@ -380,11 +442,11 @@ func (c *Client) PutTarFromURL(tarURL, dir string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	return c.doOK(req)
+	return c.doOK(req.WithContext(ctx))
 }
 
 // Put writes the provided file to path (relative to workdir) and sets mode.
-func (c *Client) Put(r io.Reader, path string, mode os.FileMode) error {
+func (c *Client) Put(ctx context.Context, r io.Reader, path string, mode os.FileMode) error {
 	param := url.Values{
 		"path": {path},
 		"mode": {fmt.Sprint(int64(mode))},
@@ -393,7 +455,7 @@ func (c *Client) Put(r io.Reader, path string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	return c.doOK(req)
+	return c.doOK(req.WithContext(ctx))
 }
 
 // GetTar returns a .tar.gz stream of the given directory, relative to the buildlet's work dir.
@@ -459,9 +521,6 @@ type ExecOpts struct {
 	// response from the buildlet, but before the output begins
 	// writing to Output.
 	OnStartExec func()
-
-	// Timeout is an optional duration before ErrTimeout is returned.
-	Timeout time.Duration
 }
 
 var ErrTimeout = errors.New("buildlet: timeout waiting for command to complete")
@@ -473,7 +532,10 @@ var ErrTimeout = errors.New("buildlet: timeout waiting for command to complete")
 // were system errors preventing the command from being started or
 // seen to completition. If execErr is non-nil, the remoteErr is
 // meaningless.
-func (c *Client) Exec(cmd string, opts ExecOpts) (remoteErr, execErr error) {
+//
+// If the context's deadline is exceeded, the returned execErr is
+// ErrTimeout.
+func (c *Client) Exec(ctx context.Context, cmd string, opts ExecOpts) (remoteErr, execErr error) {
 	var mode string
 	if opts.SystemLevel {
 		mode = "sys"
@@ -497,6 +559,7 @@ func (c *Client) Exec(cmd string, opts ExecOpts) (remoteErr, execErr error) {
 	if err != nil {
 		return nil, err
 	}
+	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	// The first thing the buildlet's exec handler does is flush the headers, so
@@ -548,17 +611,16 @@ func (c *Client) Exec(cmd string, opts ExecOpts) (remoteErr, execErr error) {
 			resc <- errs{} // success
 		}
 	}()
-	var timer <-chan time.Time
-	if opts.Timeout > 0 {
-		t := time.NewTimer(opts.Timeout)
-		defer t.Stop()
-		timer = t.C
-	}
 	select {
-	case <-timer:
-		c.MarkBroken()
-		return nil, ErrTimeout
 	case res := <-resc:
+		if res.execErr != nil {
+			c.MarkBroken()
+			if res.execErr == context.DeadlineExceeded {
+				// Historical pre-context value.
+				// TODO: update docs & callers to just use the context value.
+				res.execErr = ErrTimeout
+			}
+		}
 		return res.remoteErr, res.execErr
 	case <-c.peerDead:
 		return nil, c.deadErr
@@ -566,7 +628,7 @@ func (c *Client) Exec(cmd string, opts ExecOpts) (remoteErr, execErr error) {
 }
 
 // RemoveAll deletes the provided paths, relative to the work directory.
-func (c *Client) RemoveAll(paths ...string) error {
+func (c *Client) RemoveAll(ctx context.Context, paths ...string) error {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -576,7 +638,7 @@ func (c *Client) RemoveAll(paths ...string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	return c.doOK(req)
+	return c.doOK(req.WithContext(ctx))
 }
 
 // DestroyVM shuts down the buildlet and destroys the VM instance.
@@ -633,7 +695,7 @@ type Status struct {
 }
 
 // Status returns an Status value describing this buildlet.
-func (c *Client) Status() (Status, error) {
+func (c *Client) Status(ctx context.Context) (Status, error) {
 	select {
 	case <-c.peerDead:
 		return Status{}, c.deadErr
@@ -644,6 +706,7 @@ func (c *Client) Status() (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
+	req = req.WithContext(ctx)
 	resp, err := c.doHeaderTimeout(req, 10*time.Second) // plenty of time
 	if err != nil {
 		return Status{}, err
@@ -664,11 +727,12 @@ func (c *Client) Status() (Status, error) {
 }
 
 // WorkDir returns the absolute path to the buildlet work directory.
-func (c *Client) WorkDir() (string, error) {
+func (c *Client) WorkDir(ctx context.Context) (string, error) {
 	req, err := http.NewRequest("GET", c.URL()+"/workdir", nil)
 	if err != nil {
 		return "", err
 	}
+	req = req.WithContext(ctx)
 	resp, err := c.doHeaderTimeout(req, 10*time.Second) // plenty of time
 	if err != nil {
 		return "", err
@@ -752,7 +816,7 @@ type ListDirOpts struct {
 // ListDir lists the contents of a directory.
 // The fn callback is run for each entry.
 // The directory dir itself is not included.
-func (c *Client) ListDir(dir string, opts ListDirOpts, fn func(DirEntry)) error {
+func (c *Client) ListDir(ctx context.Context, dir string, opts ListDirOpts, fn func(DirEntry)) error {
 	param := url.Values{
 		"dir":       {dir},
 		"recursive": {fmt.Sprint(opts.Recursive)},
@@ -763,7 +827,7 @@ func (c *Client) ListDir(dir string, opts ListDirOpts, fn func(DirEntry)) error 
 	if err != nil {
 		return err
 	}
-	resp, err := c.do(req)
+	resp, err := c.do(req.WithContext(ctx))
 	if err != nil {
 		return err
 	}
@@ -834,4 +898,22 @@ func condRun(fn func()) {
 	if fn != nil {
 		fn()
 	}
+}
+
+type onEOFReadCloser struct {
+	rc io.ReadCloser
+	fn func()
+}
+
+func (o onEOFReadCloser) Read(p []byte) (n int, err error) {
+	n, err = o.rc.Read(p)
+	if err == io.EOF {
+		o.fn()
+	}
+	return
+}
+
+func (o onEOFReadCloser) Close() error {
+	o.fn()
+	return o.rc.Close()
 }
