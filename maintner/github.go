@@ -215,6 +215,19 @@ func (pr *GitHubIssue) ForeachReview(fn func(*GitHubReview) error) error {
 	return nil
 }
 
+func (g *GitHubRepo) MarkTombstoned(pr *GitHubIssue) error {
+	mp := &maintpb.Mutation{
+		GithubIssue: &maintpb.GithubIssueMutation{
+			Owner:    g.ID().Owner,
+			Repo:     g.ID().Repo,
+			Number:   pr.Number,
+			NotExist: true,
+		},
+	}
+	g.github.c.addMutation(mp)
+	return nil
+}
+
 func (g *GitHubRepo) getOrCreateMilestone(id int64) *GitHubMilestone {
 	if id == 0 {
 		panic("zero id")
