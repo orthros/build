@@ -1052,3 +1052,93 @@ func TestParseGithubRefs(t *testing.T) {
 		}
 	}
 }
+
+func TestGetIssue(t *testing.T) {
+	tests := []struct {
+		r    *GitHubRepo
+		i    int32
+		want *GitHubIssue
+	}{
+		{
+			&GitHubRepo{
+				issues: map[int32]*GitHubIssue{},
+			},
+			1,
+			nil,
+		},
+		{
+			&GitHubRepo{
+				issues: map[int32]*GitHubIssue{
+					1: &GitHubIssue{Number: 1},
+				},
+			},
+			1,
+			&GitHubIssue{
+				Number: 1,
+			},
+		},
+
+		{
+			&GitHubRepo{
+				issues: map[int32]*GitHubIssue{
+					1: &GitHubIssue{Number: 1},
+				},
+			},
+			2,
+			nil,
+		},
+	}
+	for _, tt := range tests {
+		got := tt.r.GetIssue(tt.i)
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("GetIssue(%v) = %v; want %v", tt.i, got, tt.want)
+		}
+	}
+}
+
+func TestForIssue(t *testing.T) {
+	tests := []struct {
+		r    *GitHubRepo
+		i    int32
+		ret  error
+		want error
+	}{
+		{
+			&GitHubRepo{
+				issues: map[int32]*GitHubIssue{},
+			},
+			1,
+			nil,
+			ErrIssueNotFound,
+		},
+		{
+			&GitHubRepo{
+				issues: map[int32]*GitHubIssue{
+					1: &GitHubIssue{},
+				},
+			},
+			1,
+			fmt.Errorf("foo"),
+			fmt.Errorf("foo"),
+		},
+		{
+			&GitHubRepo{
+				issues: map[int32]*GitHubIssue{
+					1: &GitHubIssue{},
+				},
+			},
+			2,
+			fmt.Errorf("foo"),
+			ErrIssueNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		got := tt.r.ForIssue(tt.i, func(*GitHubIssue) error {
+			return tt.ret
+		})
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("GetIssue(%v) = %v; want %v", tt.i, got, tt.want)
+		}
+	}
+}

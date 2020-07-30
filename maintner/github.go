@@ -143,6 +143,31 @@ func (gr *GitHubRepo) ForeachMilestone(fn func(*GitHubMilestone) error) error {
 	return nil
 }
 
+// ErrIssueNotFound represents the case where an issue is not found.
+var ErrIssueNotFound = fmt.Errorf("issue not found.")
+
+// GetIssue returns a GitHubIssue with the given ID.
+//
+// It returns nil if no issue with the given ID exists
+func (gr *GitHubRepo) GetIssue(id int32) *GitHubIssue {
+	if gi, ok := gr.issues[id]; ok {
+		return gi
+	}
+	return nil
+}
+
+// ForIssue finds the GitHubIssue with the given ID and executes the given fn.
+//
+// The fn function's return value is the return value of fn, unless the
+// GitHubIssue is not found at which point it returns ErrIssueNotFound
+func (gr *GitHubRepo) ForIssue(id int32, fn func(*GitHubIssue) error) error {
+	gi := gr.GetIssue(id)
+	if gi == nil {
+		return ErrIssueNotFound
+	}
+	return fn(gi)
+}
+
 // ForeachIssue calls fn for each issue in the repo.
 //
 // If fn returns an error, iteration ends and ForeachIssue returns
@@ -2682,7 +2707,7 @@ func isTombstoneError(err error) bool {
 	// error, so we need to treat and parse it as such
 	//
 	// Furthermore, if an issue is delted the api returns 410 (Gone) and needs
-	// to be tombstoned.  
+	// to be tombstoned.
 	if ge, ok := err.(*github.ErrorResponse); ok {
 		return ge.Response.StatusCode == http.StatusNotFound ||
 			ge.Response.StatusCode == http.StatusGone
